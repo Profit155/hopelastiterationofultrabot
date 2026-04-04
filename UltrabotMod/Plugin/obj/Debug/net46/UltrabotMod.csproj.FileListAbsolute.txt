@@ -1,0 +1,5 @@
+D:\Games\I HOPE LASTULTRABOT\UltrabotMod\Plugin\obj\Debug\net46\UltrabotMod.csproj.AssemblyReference.cache
+D:\Games\I HOPE LASTULTRABOT\UltrabotMod\Plugin\obj\Debug\net46\UltrabotMod.GeneratedMSBuildEditorConfig.editorconfig
+D:\Games\I HOPE LASTULTRABOT\UltrabotMod\Plugin\obj\Debug\net46\UltrabotMod.AssemblyInfoInputs.cache
+D:\Games\I HOPE LASTULTRABOT\UltrabotMod\Plugin\obj\Debug\net46\UltrabotMod.AssemblyInfo.cs
+D:\Games\I HOPE LASTULTRABOT\UltrabotMod\Plugin\obj\Debug\net46\UltrabotMod.csproj.CoreCompileInputs.cache

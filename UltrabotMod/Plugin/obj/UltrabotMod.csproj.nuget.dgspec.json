@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "restore": {
+    "D:\\Games\\I HOPE LASTULTRABOT\\UltrabotMod\\Plugin\\UltrabotMod.csproj": {}
+  },
+  "projects": {
+    "D:\\Games\\I HOPE LASTULTRABOT\\UltrabotMod\\Plugin\\UltrabotMod.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\Games\\I HOPE LASTULTRABOT\\UltrabotMod\\Plugin\\UltrabotMod.csproj",
+        "projectName": "UltrabotMod",
+        "projectPath": "D:\\Games\\I HOPE LASTULTRABOT\\UltrabotMod\\Plugin\\UltrabotMod.csproj",
+        "packagesPath": "C:\\Users\\User\\.nuget\\packages\\",
+        "outputPath": "D:\\Games\\I HOPE LASTULTRABOT\\UltrabotMod\\Plugin\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\User\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net471"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net471": {
+            "targetAlias": "net471",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.200"
+      },
+      "frameworks": {
+        "net471": {
+          "targetAlias": "net471",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.201\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
