@@ -1,6 +1,9 @@
+using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.AI;
+using Object = UnityEngine.Object;
 
 namespace UltrabotMod
 {
@@ -56,6 +59,15 @@ namespace UltrabotMod
         private float _cachedNavDirX, _cachedNavDirY, _cachedNavDirZ;
         private float _cachedNavDist = 1f;
         private float _cachedNavHasPath;
+        private const float DoorOpenDistance = 8f;
+        private const int DoorCacheIntervalFrames = 30;
+        private bool _doorReflectionResolved;
+        private Type _doorType;
+        private FieldInfo _doorOpenField;
+        private FieldInfo _doorLockedField;
+        private MethodInfo _doorOpenMethod;
+        private Object[] _cachedDoors;
+        private int _doorCacheFrame;
 
         public bool IsReady => _player != null && !_player.dead;
 
@@ -84,6 +96,8 @@ namespace UltrabotMod
             _cachedNavDirZ = 0f;
             _cachedNavDist = 1f;
             _cachedNavHasPath = 0f;
+            _cachedDoors = null;
+            _doorCacheFrame = 0;
             if (_actionExecutor != null)
                 _actionExecutor.ClearNavDestination();
         }
@@ -418,7 +432,8 @@ namespace UltrabotMod
                         navEnd = navHit.position;
 
                     if (NavMesh.CalculatePath(navStart, navEnd, NavMesh.AllAreas, _navPath)
-                        && _navPath.status == NavMeshPathStatus.PathComplete
+                        && (_navPath.status == NavMeshPathStatus.PathComplete
+                            || _navPath.status == NavMeshPathStatus.PathPartial)
                         && _navPath.corners.Length >= 2
                         && TryGetSteeringCorner(playerPos, out nextCorner, out remainingDistance))
                     {
@@ -435,6 +450,7 @@ namespace UltrabotMod
 
                 if (!pathOk)
                 {
+                    TryOpenNearbyDoors(playerPos, _player.transform.forward);
                     _cachedNavDirX = 0f;
                     _cachedNavDirY = 0f;
                     _cachedNavDirZ = 0f;
@@ -458,6 +474,106 @@ namespace UltrabotMod
             obs[idx++] = _cachedNavDirZ;
             obs[idx++] = _cachedNavDist;
             obs[idx++] = _cachedNavHasPath;
+        }
+
+        private void TryOpenNearbyDoors(Vector3 playerPos, Vector3 playerForward)
+        {
+            if (!EnsureDoorReflection())
+                return;
+
+            int frame = Time.frameCount;
+            if (_cachedDoors == null || (frame - _doorCacheFrame) >= DoorCacheIntervalFrames)
+            {
+                _doorCacheFrame = frame;
+                _cachedDoors = Object.FindObjectsOfType(_doorType);
+            }
+
+            if (_cachedDoors == null || _doorOpenField == null || _doorLockedField == null || _doorOpenMethod == null)
+                return;
+
+            Vector3 forward = playerForward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.0001f)
+                forward = Vector3.forward;
+            forward.Normalize();
+
+            for (int i = 0; i < _cachedDoors.Length; i++)
+            {
+                var door = _cachedDoors[i];
+                var doorComponent = door as Component;
+                if (door == null || doorComponent == null)
+                    continue;
+
+                object openValue = _doorOpenField.GetValue(door);
+                if (openValue is bool isOpen && isOpen)
+                    continue;
+
+                object lockedValue = _doorLockedField.GetValue(door);
+                if (lockedValue is bool isLocked && isLocked)
+                    continue;
+
+                Vector3 toDoor = doorComponent.transform.position - playerPos;
+                float distance = toDoor.magnitude;
+                if (distance <= 0.01f || distance > DoorOpenDistance)
+                    continue;
+
+                Vector3 toDoorDir = toDoor / distance;
+                if (Vector3.Dot(toDoorDir, forward) <= 0.3f)
+                    continue;
+
+                _doorOpenMethod.Invoke(door, new object[] { false, false });
+            }
+        }
+
+        private bool EnsureDoorReflection()
+        {
+            if (_doorType != null && _doorOpenField != null && _doorLockedField != null && _doorOpenMethod != null)
+                return true;
+
+            if (_doorReflectionResolved)
+                return false;
+
+            _doorReflectionResolved = true;
+            _doorType = Type.GetType("Door");
+
+            if (_doorType == null)
+            {
+                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                for (int i = 0; i < assemblies.Length && _doorType == null; i++)
+                {
+                    Type[] types;
+                    try
+                    {
+                        types = assemblies[i].GetTypes();
+                    }
+                    catch (ReflectionTypeLoadException ex)
+                    {
+                        types = ex.Types;
+                    }
+
+                    if (types == null)
+                        continue;
+
+                    for (int j = 0; j < types.Length; j++)
+                    {
+                        var candidate = types[j];
+                        if (candidate != null && candidate.Name == "Door")
+                        {
+                            _doorType = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (_doorType == null)
+                return false;
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            _doorOpenField = _doorType.GetField("open", flags);
+            _doorLockedField = _doorType.GetField("locked", flags);
+            _doorOpenMethod = _doorType.GetMethod("Open", flags, null, new[] { typeof(bool), typeof(bool) }, null);
+            return _doorOpenField != null && _doorLockedField != null && _doorOpenMethod != null;
         }
 
         /// <summary>
