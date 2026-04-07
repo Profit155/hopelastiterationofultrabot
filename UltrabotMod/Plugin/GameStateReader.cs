@@ -451,19 +451,53 @@ namespace UltrabotMod
                 if (!pathOk)
                 {
                     TryOpenNearbyDoors(playerPos, _player.transform.forward);
-                    _cachedNavDirX = 0f;
-                    _cachedNavDirY = 0f;
-                    _cachedNavDirZ = 0f;
-                    _cachedNavDist = 1f;
-                    _cachedNavHasPath = 0f;
+
+                    if (foundTarget)
+                    {
+                        // No valid NavMesh path but we know the target.
+                        // Use straight-line direction so the bot pushes toward
+                        // the door instead of going aimless/backward.
+                        // This also ensures the bot physically triggers DoorController.
+                        Vector3 fallback = target - playerPos;
+                        fallback.y = 0f;
+                        float fbDist = fallback.magnitude;
+                        if (fbDist > 0.1f)
+                        {
+                            fallback /= fbDist;
+                            _cachedNavDirX = fallback.x;
+                            _cachedNavDirY = 0f;
+                            _cachedNavDirZ = fallback.z;
+                            _cachedNavDist = Mathf.Clamp01(fbDist / 200f);
+                            _cachedNavHasPath = 0f; // 0 = no real path, just hint
+                        }
+                        else
+                        {
+                            _cachedNavDirX = 0f;
+                            _cachedNavDirY = 0f;
+                            _cachedNavDirZ = 0f;
+                            _cachedNavDist = 1f;
+                            _cachedNavHasPath = 0f;
+                        }
+                    }
+                    else
+                    {
+                        _cachedNavDirX = 0f;
+                        _cachedNavDirY = 0f;
+                        _cachedNavDirZ = 0f;
+                        _cachedNavDist = 1f;
+                        _cachedNavHasPath = 0f;
+                    }
                 }
 
-                // Steering target = next corner if path valid, otherwise CLEAR
-                // (RL gets full control instead of being pulled at unreachable target).
+                // Steering target = next corner if path valid,
+                // fallback = straight line to target if path blocked,
+                // clear = no target at all.
                 if (_actionExecutor != null)
                 {
                     if (pathOk)
                         _actionExecutor.SetNavDestination(nextCorner);
+                    else if (foundTarget)
+                        _actionExecutor.SetNavDestination(target); // straight-line fallback
                     else
                         _actionExecutor.ClearNavDestination();
                 }
