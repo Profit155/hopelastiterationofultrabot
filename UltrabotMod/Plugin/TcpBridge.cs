@@ -279,9 +279,23 @@ namespace UltrabotMod
                     rewHeight = -0.01f * (heightAboveSpawn - 10f);
             }
 
+            // === Anti-spam penalties ===
+            var ae = _actionExecutor;
+            float rewJitter = -0.03f * ae.CameraJitter - 0.01f * ae.MoveJitter;
+            float rewWasted = -0.02f * ae.WastedActions;
+            float rewBank = -0.05f * ae.DashUsed - 0.05f * ae.PunchUsed;
+            float rewSlamAbuse = -0.10f * ae.SlamTriggered;
+            float rewSwitchSpam = -0.05f * ae.WeaponSwitches;
+            float rewWhipSpam = -0.03f * ae.WhiplashFired;
+            float rewFireTog = -0.02f * Mathf.Max(0, ae.FireToggles - 1);
+            float rewMash = -0.01f * Mathf.Max(0, ae.ButtonsHeldCount - 3);
+
             // === Sum up ===
             reward = rewStyle + rewKills + rewParry + rewHeadshot + rewRank
-                   + rewSurvival + rewDamage + rewDeath + rewExplore + rewHeight - 0.001f;
+                   + rewSurvival + rewDamage + rewDeath + rewExplore + rewHeight
+                   + rewJitter + rewWasted + rewBank + rewSlamAbuse
+                   + rewSwitchSpam + rewWhipSpam + rewFireTog + rewMash
+                   - 0.001f;
 
             // Update cumulative stats
             _totalKills += events.KillsThisStep;
@@ -302,6 +316,14 @@ namespace UltrabotMod
                 HUD.RewDeath = rewDeath;
                 HUD.RewExplore = rewExplore;
                 HUD.RewSurvival = rewSurvival;
+                HUD.RewJitter = rewJitter;
+                HUD.RewWasted = rewWasted;
+                HUD.RewBank = rewBank;
+                HUD.RewSlamAbuse = rewSlamAbuse;
+                HUD.RewSwitchSpam = rewSwitchSpam;
+                HUD.RewWhipSpam = rewWhipSpam;
+                HUD.RewFireTog = rewFireTog;
+                HUD.RewMash = rewMash;
             }
 
             return reward;

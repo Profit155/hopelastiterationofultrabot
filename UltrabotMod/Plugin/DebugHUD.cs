@@ -39,6 +39,14 @@ namespace UltrabotMod
         public float RewDeath;
         public float RewExplore;
         public float RewSurvival;
+        public float RewJitter;
+        public float RewWasted;
+        public float RewBank;
+        public float RewSlamAbuse;
+        public float RewSwitchSpam;
+        public float RewWhipSpam;
+        public float RewFireTog;
+        public float RewMash;
 
         private static readonly string[] RankNames = {
             "D", "C", "B", "A", "S", "SS", "SSS", "ULTRAKILL"
@@ -69,7 +77,7 @@ namespace UltrabotMod
             }
 
             float w = 280;
-            float h = 380;
+            float h = 540;
             float x = Screen.width - w - 10;
             float y = 10;
 
@@ -101,6 +109,14 @@ namespace UltrabotMod
             DrawLine(ref ly, lx, lh, $"Rank:     {RewRank:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Explore:  {RewExplore:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Damage:   {RewDamage:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Jitter:    {RewJitter:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Wasted:    {RewWasted:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Bank:      {RewBank:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"SlamAbuse: {RewSlamAbuse:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"SwitchSpm: {RewSwitchSpam:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"WhipSpm:   {RewWhipSpam:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"FireTog:   {RewFireTog:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Mash:      {RewMash:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Total:    {LastReward:+0.000;-0.000}  (cum: {CumulativeReward:+0.0;-0.0})");
         }
 

@@ -60,6 +60,21 @@ namespace UltrabotMod
         // Edge detection
         private bool[] _prevButtons = new bool[ActionSize];
 
+        // === Spam / jitter metrics, read by TcpBridge after Execute() ===
+        public float CameraJitter;
+        public float MoveJitter;
+        public int WastedActions;
+        public int DashUsed;
+        public int PunchUsed;
+        public int SlamTriggered;
+        public int WeaponSwitches;
+        public int WhiplashFired;
+        public int FireToggles;
+        public int ButtonsHeldCount;
+
+        private float _prevRawYaw, _prevRawPitch;
+        private float _prevMoveFwd, _prevMoveRight;
+
         // Camera smoothing
         private float _smoothYaw;
         private float _smoothPitch;
@@ -223,11 +238,32 @@ namespace UltrabotMod
             if (_whiplashCooldown > 0) _whiplashCooldown--;
             if (_slamCooldown > 0) _slamCooldown--;
 
+            // Reset per-step spam/jitter counters
+            CameraJitter = 0f;
+            MoveJitter = 0f;
+            WastedActions = 0;
+            DashUsed = 0;
+            PunchUsed = 0;
+            SlamTriggered = 0;
+            WeaponSwitches = 0;
+            WhiplashFired = 0;
+            FireToggles = 0;
+            ButtonsHeldCount = 0;
+
             // --- Camera / Aiming (with smoothing) ---
             if (_camera != null)
             {
                 float rawYaw = actions[2] * LookSensitivity;
                 float rawPitch = actions[3] * LookSensitivity;
+
+                // Camera jitter: sign-flip detection on raw input
+                if (rawYaw * _prevRawYaw < 0f)
+                    CameraJitter += Mathf.Abs(rawYaw - _prevRawYaw);
+                if (rawPitch * _prevRawPitch < 0f)
+                    CameraJitter += Mathf.Abs(rawPitch - _prevRawPitch);
+                _prevRawYaw = rawYaw;
+                _prevRawPitch = rawPitch;
+
                 _smoothYaw = Mathf.Lerp(_smoothYaw, rawYaw, 0.3f);
                 _smoothPitch = Mathf.Lerp(_smoothPitch, rawPitch, 0.3f);
                 _camera.rotationX += _smoothYaw;
@@ -237,6 +273,16 @@ namespace UltrabotMod
                     _camera.minimumY,
                     _camera.maximumY);
             }
+
+            // Move jitter: sign-flip detection on move axes
+            float moveFwd = actions[0];
+            float moveRight = actions[1];
+            if (moveFwd * _prevMoveFwd < 0f)
+                MoveJitter += Mathf.Abs(moveFwd - _prevMoveFwd);
+            if (moveRight * _prevMoveRight < 0f)
+                MoveJitter += Mathf.Abs(moveRight - _prevMoveRight);
+            _prevMoveFwd = moveFwd;
+            _prevMoveRight = moveRight;
 
             // --- Movement via inputDir ---
             if (_player.activated && _inputDirField != null)
@@ -273,14 +319,25 @@ namespace UltrabotMod
                     _player.Jump();
                     _jumpCooldown = JumpCD;
                 }
+                else
+                {
+                    WastedActions++;
+                }
             }
 
             // DASH — only if stamina available
-            if (dash && !_prevButtons[5] && _dashCooldown <= 0 && _player.activated
-                && _player.boostCharge >= 100f)
+            if (dash && !_prevButtons[5])
             {
-                _dodgeMethod?.Invoke(_player, null);
-                _dashCooldown = DashCD;
+                if (_dashCooldown <= 0 && _player.activated && _player.boostCharge >= 100f)
+                {
+                    _dodgeMethod?.Invoke(_player, null);
+                    _dashCooldown = DashCD;
+                    DashUsed++;
+                }
+                else
+                {
+                    WastedActions++;
+                }
             }
 
             // SLIDE — only if on ground
@@ -292,6 +349,10 @@ namespace UltrabotMod
                     _startSlideMethod?.Invoke(_player, null);
                     _slideCooldown = SlideCD;
                 }
+                else
+                {
+                    WastedActions++;
+                }
             }
             else if (!slide && _player.sliding)
             {
@@ -299,53 +360,110 @@ namespace UltrabotMod
             }
 
             // SLAM — only if in the air
-            if (slam && !_prevButtons[18] && _slamCooldown <= 0 && _player.falling)
+            if (slam && !_prevButtons[18])
             {
-                _player.Slamdown(1f);
-                _slamCooldown = SlamCD;
+                if (_slamCooldown <= 0 && _player.falling)
+                {
+                    _player.Slamdown(1f);
+                    _slamCooldown = SlamCD;
+                    SlamTriggered++;
+                }
+                else
+                {
+                    WastedActions++;
+                }
             }
 
+            // Anti-pattern: bot tries to jump+slide simultaneously (in-air slide = Slamdown)
+            if (jump && slide && !_prevButtons[4] && !_prevButtons[6])
+                SlamTriggered++;
+
             // WHIPLASH — only if equipped
-            if (whiplash && !_prevButtons[17] && _whiplashCooldown <= 0 && _hookArm != null
-                && _hookArm.equipped)
+            if (whiplash && !_prevButtons[17])
             {
-                _hookArm.SendMessage("ThrowHook", SendMessageOptions.DontRequireReceiver);
-                _whiplashCooldown = WhiplashCD;
+                if (_whiplashCooldown <= 0 && _hookArm != null && _hookArm.equipped)
+                {
+                    _hookArm.SendMessage("ThrowHook", SendMessageOptions.DontRequireReceiver);
+                    _whiplashCooldown = WhiplashCD;
+                    WhiplashFired++;
+                }
+                else
+                {
+                    WastedActions++;
+                }
             }
 
             // PUNCH — only if ready
-            if (punch && !_prevButtons[9] && _punchCooldown <= 0)
+            if (punch && !_prevButtons[9])
             {
-                if (_fistControl != null && _fistControl.currentPunch != null
+                if (_punchCooldown <= 0 && _fistControl != null && _fistControl.currentPunch != null
                     && _fistControl.currentPunch.ready && _fistControl.fistCooldown <= 0f)
                 {
                     _fistControl.currentPunch.PunchStart();
                     _punchCooldown = PunchCD;
+                    PunchUsed++;
+                }
+                else
+                {
+                    WastedActions++;
                 }
             }
 
             // WEAPON SLOTS
-            if (_gunControl != null && _weaponSwitchCooldown <= 0)
+            if (_gunControl != null)
             {
-                for (int slot = 0; slot < 6; slot++)
+                if (_weaponSwitchCooldown <= 0)
                 {
-                    if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                    bool switched = false;
+                    for (int slot = 0; slot < 6; slot++)
                     {
-                        _gunControl.SwitchWeapon(slot, null, true, false, false);
+                        if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                        {
+                            if (slot == _gunControl.currentSlotIndex)
+                            {
+                                WastedActions++;
+                            }
+                            else
+                            {
+                                _gunControl.SwitchWeapon(slot, null, true, false, false);
+                                _weaponSwitchCooldown = WeaponCD;
+                                WeaponSwitches++;
+                                switched = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!switched && swapVar && !_prevButtons[19] && _weaponSwitchCooldown <= 0)
+                    {
+                        int nextVar = (_gunControl.currentVariationIndex + 1);
+                        _gunControl.SwitchWeapon(
+                            _gunControl.currentSlotIndex, nextVar,
+                            false, false, true);
                         _weaponSwitchCooldown = WeaponCD;
-                        break;
+                        WeaponSwitches++;
                     }
                 }
-
-                if (swapVar && !_prevButtons[19] && _weaponSwitchCooldown <= 0)
+                else
                 {
-                    int nextVar = (_gunControl.currentVariationIndex + 1);
-                    _gunControl.SwitchWeapon(
-                        _gunControl.currentSlotIndex, nextVar,
-                        false, false, true);
-                    _weaponSwitchCooldown = WeaponCD;
+                    // On cooldown but pressed: count wasted edges
+                    for (int slot = 0; slot < 6; slot++)
+                        if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                            WastedActions++;
+                    if (swapVar && !_prevButtons[19])
+                        WastedActions++;
                 }
             }
+
+            // FireToggles & ButtonsHeldCount
+            if (firePrimary != _prevButtons[7]) FireToggles++;
+            if (fireSecondary != _prevButtons[8]) FireToggles++;
+
+            ButtonsHeldCount = (jump ? 1 : 0) + (dash ? 1 : 0) + (slide ? 1 : 0)
+                + (firePrimary ? 1 : 0) + (fireSecondary ? 1 : 0) + (punch ? 1 : 0)
+                + (whiplash ? 1 : 0) + (slam ? 1 : 0) + (swapVar ? 1 : 0);
+            for (int s = 0; s < 6; s++)
+                if (actions[10 + s] > 0.5f) ButtonsHeldCount++;
 
             // FIRE — via PlayerInput's InputActionState (weapons read these in Update())
             if (_fireSystemReady)
@@ -370,6 +488,10 @@ namespace UltrabotMod
             _prevButtons = new bool[ActionSize];
             _smoothYaw = 0f;
             _smoothPitch = 0f;
+            _prevRawYaw = 0f;
+            _prevRawPitch = 0f;
+            _prevMoveFwd = 0f;
+            _prevMoveRight = 0f;
 
             if (_player != null && _inputDirField != null)
                 _inputDirField.SetValue(_player, Vector3.zero);
