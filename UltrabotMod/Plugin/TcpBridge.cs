@@ -392,8 +392,21 @@ namespace UltrabotMod
             // === Sum up ===
             float rewStepCost = -0.002f;
             float rewWastedShot = wastedShot ? -0.05f : 0f;
+
+            // === Anti-spam penalties (read metrics from ActionExecutor) ===
+            var ae = _actionExecutor;
+            float rewJitter     = -0.03f * ae.CameraJitter - 0.01f * ae.MoveJitter;
+            float rewWasted     = -0.02f * ae.WastedActions;
+            float rewBank       = -0.05f * ae.DashUsed - 0.05f * ae.PunchUsed;
+            float rewSlamAbuse  = -0.10f * ae.SlamTriggered;
+            float rewSwitchSpam = -0.05f * ae.WeaponSwitches;
+            float rewWhipSpam   = -0.03f * ae.WhiplashFired;
+            float rewFireTog    = -0.02f * Mathf.Max(0, ae.FireToggles - 1);
+            float rewMash       = -0.01f * Mathf.Max(0, ae.ButtonsHeldCount - 3);
+
             reward = rewStyle + rewKills + rewParry + rewHeadshot + rewRank
-                   + rewDamage + rewDeath + rewExplore + rewHeight + rewFacing + rewStepCost + rewWastedShot;
+                   + rewDamage + rewDeath + rewExplore + rewHeight + rewFacing + rewStepCost + rewWastedShot
+                   + rewJitter + rewWasted + rewBank + rewSlamAbuse + rewSwitchSpam + rewWhipSpam + rewFireTog + rewMash;
 
             // Update cumulative stats
             _totalKills += events.KillsThisStep;
@@ -416,6 +429,14 @@ namespace UltrabotMod
                 HUD.RewHeight = rewHeight;
                 HUD.RewFacing = rewFacing;
                 HUD.RewStepCost = rewStepCost;
+                HUD.RewJitter = rewJitter;
+                HUD.RewWasted = rewWasted;
+                HUD.RewBank = rewBank;
+                HUD.RewSlamAbuse = rewSlamAbuse;
+                HUD.RewSwitchSpam = rewSwitchSpam;
+                HUD.RewWhipSpam = rewWhipSpam;
+                HUD.RewFireTog = rewFireTog;
+                HUD.RewMash = rewMash;
                 HUD.NavAgentActive = _actionExecutor.IsNavAgentActive;
                 HUD.NavAgentDist = _actionExecutor.NavTargetDistance;
             }

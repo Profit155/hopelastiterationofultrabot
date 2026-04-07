@@ -42,6 +42,16 @@ namespace UltrabotMod
         public float RewFacing;
         public float RewStepCost;
 
+        // Anti-spam reward breakdown
+        public float RewJitter;
+        public float RewWasted;
+        public float RewBank;
+        public float RewSlamAbuse;
+        public float RewSwitchSpam;
+        public float RewWhipSpam;
+        public float RewFireTog;
+        public float RewMash;
+
         // NavMesh status
         public bool NavAgentActive;
         public float NavAgentDist;
@@ -75,7 +85,7 @@ namespace UltrabotMod
             }
 
             float w = 300;
-            float h = 480;
+            float h = 640;
             float x = Screen.width - w - 10;
             float y = 10;
 
@@ -112,6 +122,15 @@ namespace UltrabotMod
             DrawLine(ref ly, lx, lh, $"Damage:    {RewDamage:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Death:     {RewDeath:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Step cost: {RewStepCost:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, "--- Anti-spam ---");
+            DrawLine(ref ly, lx, lh, $"Jitter:    {RewJitter:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Wasted:    {RewWasted:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Bank:      {RewBank:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"SlamAbuse: {RewSlamAbuse:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"SwitchSpm: {RewSwitchSpam:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"WhipSpm:   {RewWhipSpam:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"FireTog:   {RewFireTog:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Mash:      {RewMash:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, "");
             DrawLine(ref ly, lx, lh, $"Step total:  {LastReward:+0.000;-0.000}");
             DrawLine(ref ly, lx, lh, $"Episode sum: {CumulativeReward:+0.0;-0.0}");
