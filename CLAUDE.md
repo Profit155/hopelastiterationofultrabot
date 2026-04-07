@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Workflow (MANDATORY)
+
+**master is protected. Never commit or push directly to master.**
+
+Before making ANY code changes:
+1. Create a new branch: `git checkout -b <short-description>`
+2. Make changes and commit on that branch
+3. Push the branch: `git push origin <branch-name>`
+4. Open a PR to merge into master: `gh pr create`
+
+Branch naming: `feature/`, `fix/`, `refactor/` prefix + short description (e.g. `fix/navmesh-reset`, `feature/aim-hint`).
+
 ## Project Overview
 
 UltrabotMod is a reinforcement learning bot for ULTRAKILL. It has two halves:
