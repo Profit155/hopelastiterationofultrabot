@@ -46,6 +46,11 @@ namespace UltrabotMod
         private CheckPoint[] _checkpoints;
         private NavMeshPath _navPath;
         private int _navQueryFrame;
+        private const int NavQueryIntervalFrames = 1;
+        private const float NavSampleRadius = 5f;
+        private const float NavCornerAdvanceDistance = 1.25f;
+        private const float NavFinalCornerReachDistance = 0.2f;
+        private const float NavCornerPassPadding = 0.05f;
 
         // Cached nav hint values (reused on non-query frames)
         private float _cachedNavDirX, _cachedNavDirY, _cachedNavDirZ;
@@ -73,14 +78,14 @@ namespace UltrabotMod
             _navPath = new NavMeshPath();
 
             // Reset nav cache so new episode never sees stale previous-episode data
-            _navQueryFrame = 0;
+            _navQueryFrame = -NavQueryIntervalFrames;
             _cachedNavDirX = 0f;
             _cachedNavDirY = 0f;
             _cachedNavDirZ = 0f;
             _cachedNavDist = 1f;
             _cachedNavHasPath = 0f;
             if (_actionExecutor != null)
-                _actionExecutor.SetNavDestination(Vector3.zero);
+                _actionExecutor.ClearNavDestination();
         }
 
         public float[] GetObservation()
@@ -290,6 +295,62 @@ namespace UltrabotMod
             return 1f;
         }
 
+        private static Vector3 Flatten(Vector3 value)
+        {
+            value.y = 0f;
+            return value;
+        }
+
+        private bool TryGetSteeringCorner(Vector3 playerPos, out Vector3 steeringCorner, out float remainingDistance)
+        {
+            steeringCorner = Vector3.zero;
+            remainingDistance = 0f;
+
+            if (_navPath == null || _navPath.corners == null || _navPath.corners.Length == 0)
+                return false;
+
+            Vector3 flatPlayer = Flatten(playerPos);
+            int steeringIndex = -1;
+
+            for (int i = 1; i < _navPath.corners.Length; i++)
+            {
+                Vector3 flatCorner = Flatten(_navPath.corners[i]);
+                float reachDistance = (i == _navPath.corners.Length - 1)
+                    ? NavFinalCornerReachDistance
+                    : NavCornerAdvanceDistance;
+
+                float cornerDistance = Vector3.Distance(flatPlayer, flatCorner);
+
+                Vector3 flatPrevCorner = Flatten(_navPath.corners[i - 1]);
+                Vector3 segment = flatCorner - flatPrevCorner;
+                float segmentLength = segment.magnitude;
+                bool passedCorner = false;
+
+                if (segmentLength > 0.001f)
+                {
+                    Vector3 segmentDir = segment / segmentLength;
+                    float progress = Vector3.Dot(flatPlayer - flatPrevCorner, segmentDir);
+                    passedCorner = progress >= (segmentLength - NavCornerPassPadding);
+                }
+
+                if (cornerDistance <= reachDistance || passedCorner)
+                    continue;
+
+                steeringIndex = i;
+                break;
+            }
+
+            if (steeringIndex < 0)
+                return false;
+
+            steeringCorner = _navPath.corners[steeringIndex];
+            remainingDistance = Vector3.Distance(playerPos, steeringCorner);
+            for (int i = steeringIndex; i < _navPath.corners.Length - 1; i++)
+                remainingDistance += Vector3.Distance(_navPath.corners[i], _navPath.corners[i + 1]);
+
+            return true;
+        }
+
         /// <summary>
         /// NavMesh GPS — priority: nearest enemy > unactivated checkpoint > level exit.
         /// Also sets NavMeshAgent destination on ActionExecutor.
@@ -297,7 +358,7 @@ namespace UltrabotMod
         private void WriteNavHint(float[] obs, ref int idx, Vector3 playerPos, List<EnemyIdentifier> enemies)
         {
             int frame = Time.frameCount;
-            bool shouldQuery = (frame - _navQueryFrame) >= 10;
+            bool shouldQuery = (frame - _navQueryFrame) >= NavQueryIntervalFrames;
 
             if (shouldQuery)
             {
@@ -344,32 +405,29 @@ namespace UltrabotMod
                 // Compute path FIRST — only arm executor steering if path is valid.
                 bool pathOk = false;
                 Vector3 nextCorner = Vector3.zero;
+                float remainingDistance = 0f;
                 if (foundTarget)
                 {
                     NavMeshHit navHit;
                     Vector3 navStart = playerPos;
                     Vector3 navEnd = target;
 
-                    if (NavMesh.SamplePosition(playerPos, out navHit, 5f, NavMesh.AllAreas))
+                    if (NavMesh.SamplePosition(playerPos, out navHit, NavSampleRadius, NavMesh.AllAreas))
                         navStart = navHit.position;
-                    if (NavMesh.SamplePosition(target, out navHit, 5f, NavMesh.AllAreas))
+                    if (NavMesh.SamplePosition(target, out navHit, NavSampleRadius, NavMesh.AllAreas))
                         navEnd = navHit.position;
 
                     if (NavMesh.CalculatePath(navStart, navEnd, NavMesh.AllAreas, _navPath)
                         && _navPath.status == NavMeshPathStatus.PathComplete
-                        && _navPath.corners.Length >= 2)
+                        && _navPath.corners.Length >= 2
+                        && TryGetSteeringCorner(playerPos, out nextCorner, out remainingDistance))
                     {
-                        nextCorner = _navPath.corners[1];
                         Vector3 dir = (nextCorner - playerPos).normalized;
-
-                        float totalDist = 0f;
-                        for (int i = 0; i < _navPath.corners.Length - 1; i++)
-                            totalDist += Vector3.Distance(_navPath.corners[i], _navPath.corners[i + 1]);
 
                         _cachedNavDirX = dir.x;
                         _cachedNavDirY = dir.y;
                         _cachedNavDirZ = dir.z;
-                        _cachedNavDist = Mathf.Clamp01(totalDist / 200f);
+                        _cachedNavDist = Mathf.Clamp01(remainingDistance / 200f);
                         _cachedNavHasPath = 1f;
                         pathOk = true;
                     }
@@ -391,7 +449,7 @@ namespace UltrabotMod
                     if (pathOk)
                         _actionExecutor.SetNavDestination(nextCorner);
                     else
-                        _actionExecutor.SetNavDestination(Vector3.zero);
+                        _actionExecutor.ClearNavDestination();
                 }
             }
 
