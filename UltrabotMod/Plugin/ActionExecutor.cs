@@ -47,6 +47,7 @@ namespace UltrabotMod
         private Vector3 _lastNavSamplePosition;
         private bool _hasNavSamplePosition;
         private int _navStuckFrames;
+        private int _navRecoveryFrames;
 
         // Input system — we cache reflection metadata but get InputActionState FRESH each frame
         // because InputManager.InputSource is a property that may return different objects
@@ -102,9 +103,10 @@ namespace UltrabotMod
         private const int ChangeFistCD = 20;
         private const float NavTargetCarryDistance = 1.5f;
         private const float NavTargetReachDistance = 0.1f;
-        private const float NavStuckMinProgress = 0.03f;
-        private const float NavStuckMinSpeed = 0.15f;
-        private const int NavStuckFrameThreshold = 18;
+        private const float NavStuckMinProgress = 0.05f;
+        private const float NavStuckMinSpeed = 0.08f;
+        private const int NavStuckFrameThreshold = 12;
+        private const int NavRecoveryCooldownFrames = 45;
         private const float WallSlideCheckDistance = 1f;
         private const float WallSlideRayHeight = 0.5f;
         private const float AimAssistPitchLimit = 20f;
@@ -199,6 +201,7 @@ namespace UltrabotMod
             _lastNavSamplePosition = Vector3.zero;
             _hasNavSamplePosition = false;
             _navStuckFrames = 0;
+            _navRecoveryFrames = 0;
         }
 
         private void SetupInputSystem()
@@ -546,12 +549,24 @@ namespace UltrabotMod
                 // NavMeshAgent desired direction (pathfinding to target)
                 var navDir = GetNavDesiredDirection();
 
+                // Tick recovery cooldown
+                if (_navRecoveryFrames > 0) _navRecoveryFrames--;
+
                 Vector3 moveDir;
+                bool inRecovery = _navRecoveryFrames > 0;
+
                 if (navDir.magnitude > 0.01f)
                 {
-                    // Blend: 60% nav direction + 40% RL direction
-                    // Bot follows navmesh path but RL can strafe/dodge
-                    moveDir = navDir * 0.6f + rlDir * 0.4f;
+                    if (inRecovery)
+                    {
+                        // Recovery mode: nav has full authority, RL cannot fight it
+                        moveDir = navDir;
+                    }
+                    else
+                    {
+                        // Normal: 80% nav + 20% RL strafe (nav is primary)
+                        moveDir = navDir * 0.8f + rlDir * 0.2f;
+                    }
                 }
                 else
                 {
@@ -562,7 +577,8 @@ namespace UltrabotMod
                 if (moveDir.magnitude > 1f)
                     moveDir.Normalize();
 
-                bool isStuck = IsNavMovementStuck(moveDir);
+                // Only run stuck detection when not already in recovery
+                bool isStuck = !inRecovery && IsNavMovementStuck(moveDir);
                 bool hasWallHit = false;
                 RaycastHit wallHit = new RaycastHit();
 
@@ -578,6 +594,10 @@ namespace UltrabotMod
 
                 if (isStuck)
                 {
+                    // Start recovery cooldown — nav-only movement for NavRecoveryCooldownFrames
+                    _navRecoveryFrames = NavRecoveryCooldownFrames;
+                    ResetNavRecovery();
+
                     if (hasWallHit)
                     {
                         moveDir = ResolveWallSlideDirection(
