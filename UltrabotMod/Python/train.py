@@ -31,6 +31,8 @@ class StyleLogCallback(BaseCallback):
                 self.logger.record("ultrakill/style_score", info["style_score"])
                 self.logger.record("ultrakill/kills", info["kills"])
                 self.logger.record("ultrakill/rank_index", info["rank_index"])
+            if "backward_nav_penalty" in info:
+                self.logger.record("ultrakill/backward_nav_penalty", info["backward_nav_penalty"])
         return True
 
 

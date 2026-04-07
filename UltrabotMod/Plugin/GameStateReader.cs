@@ -1,11 +1,50 @@
+using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.AI;
+using Object = UnityEngine.Object;
 
 namespace UltrabotMod
 {
     public class GameStateReader
     {
+        private NavMeshPath _navScratchPath;
+
+        // We do not have reliable metadata for every room gate type, so use a
+        // simple forward-progress high-water mark as a point-of-no-return heuristic.
+        private Vector3 _progressOrigin;
+        private int _progressAxis; // 0 = unknown, 1 = X, 2 = Z
+        private float _progressSign = 1f;
+        private float _maxForwardProgress;
+
+        private float _backwardTargetSuppressUntil;
+        private readonly NavTargetHistoryEntry[] _navTargetHistory = new NavTargetHistoryEntry[8];
+        private int _navTargetHistoryCount;
+        private int _navTargetHistoryNextIndex;
+
+        private const float ForwardHemisphereDotThreshold = 0f;
+        private const float ProgressLockDistance = 8f;
+        private const float ProgressBehindBuffer = 6f;
+        private const float NavLoopWindowSeconds = 5f;
+        private const float NavBackwardSuppressSeconds = 10f;
+        private const float NavTargetChangeDistance = 3f;
+
+        private struct NavTargetChoice
+        {
+            public Vector3 Target;
+            public Vector3 NextCorner;
+            public float PathDistance;
+            public bool IsForwardHemisphere;
+        }
+
+        private struct NavTargetHistoryEntry
+        {
+            public Vector3 Position;
+            public float Time;
+            public bool IsBackward;
+        }
+
         public const int MaxEnemies = 10;
         public const int MaxProjectiles = 8;
         public const int PerEnemyFeatures = 10;
@@ -46,11 +85,25 @@ namespace UltrabotMod
         private CheckPoint[] _checkpoints;
         private NavMeshPath _navPath;
         private int _navQueryFrame;
+        private const int NavQueryIntervalFrames = 1;
+        private const float NavSampleRadius = 5f;
+        private const float NavCornerAdvanceDistance = 1.25f;
+        private const float NavFinalCornerReachDistance = 0.2f;
+        private const float NavCornerPassPadding = 0.05f;
 
         // Cached nav hint values (reused on non-query frames)
         private float _cachedNavDirX, _cachedNavDirY, _cachedNavDirZ;
         private float _cachedNavDist = 1f;
         private float _cachedNavHasPath;
+        private const float DoorOpenDistance = 8f;
+        private const int DoorCacheIntervalFrames = 30;
+        private bool _doorReflectionResolved;
+        private Type _doorType;
+        private FieldInfo _doorOpenField;
+        private FieldInfo _doorLockedField;
+        private MethodInfo _doorOpenMethod;
+        private Object[] _cachedDoors;
+        private int _doorCacheFrame;
 
         public bool IsReady => _player != null && !_player.dead;
 
@@ -71,16 +124,26 @@ namespace UltrabotMod
             _camera = Object.FindObjectOfType<CameraController>();
             _checkpoints = Object.FindObjectsOfType<CheckPoint>();
             _navPath = new NavMeshPath();
+            _navScratchPath = new NavMeshPath();
 
             // Reset nav cache so new episode never sees stale previous-episode data
-            _navQueryFrame = 0;
+            _navQueryFrame = -NavQueryIntervalFrames;
             _cachedNavDirX = 0f;
             _cachedNavDirY = 0f;
             _cachedNavDirZ = 0f;
             _cachedNavDist = 1f;
             _cachedNavHasPath = 0f;
+            _progressOrigin = _player != null ? _player.transform.position : Vector3.zero;
+            _progressAxis = 0;
+            _progressSign = 1f;
+            _maxForwardProgress = 0f;
+            _backwardTargetSuppressUntil = 0f;
+            _navTargetHistoryCount = 0;
+            _navTargetHistoryNextIndex = 0;
+            _cachedDoors = null;
+            _doorCacheFrame = 0;
             if (_actionExecutor != null)
-                _actionExecutor.SetNavDestination(Vector3.zero);
+                _actionExecutor.ClearNavDestination();
         }
 
         public float[] GetObservation()
@@ -290,6 +353,62 @@ namespace UltrabotMod
             return 1f;
         }
 
+        private static Vector3 Flatten(Vector3 value)
+        {
+            value.y = 0f;
+            return value;
+        }
+
+        private bool TryGetSteeringCorner(Vector3 playerPos, out Vector3 steeringCorner, out float remainingDistance)
+        {
+            steeringCorner = Vector3.zero;
+            remainingDistance = 0f;
+
+            if (_navPath == null || _navPath.corners == null || _navPath.corners.Length == 0)
+                return false;
+
+            Vector3 flatPlayer = Flatten(playerPos);
+            int steeringIndex = -1;
+
+            for (int i = 1; i < _navPath.corners.Length; i++)
+            {
+                Vector3 flatCorner = Flatten(_navPath.corners[i]);
+                float reachDistance = (i == _navPath.corners.Length - 1)
+                    ? NavFinalCornerReachDistance
+                    : NavCornerAdvanceDistance;
+
+                float cornerDistance = Vector3.Distance(flatPlayer, flatCorner);
+
+                Vector3 flatPrevCorner = Flatten(_navPath.corners[i - 1]);
+                Vector3 segment = flatCorner - flatPrevCorner;
+                float segmentLength = segment.magnitude;
+                bool passedCorner = false;
+
+                if (segmentLength > 0.001f)
+                {
+                    Vector3 segmentDir = segment / segmentLength;
+                    float progress = Vector3.Dot(flatPlayer - flatPrevCorner, segmentDir);
+                    passedCorner = progress >= (segmentLength - NavCornerPassPadding);
+                }
+
+                if (cornerDistance <= reachDistance || passedCorner)
+                    continue;
+
+                steeringIndex = i;
+                break;
+            }
+
+            if (steeringIndex < 0)
+                return false;
+
+            steeringCorner = _navPath.corners[steeringIndex];
+            remainingDistance = Vector3.Distance(playerPos, steeringCorner);
+            for (int i = steeringIndex; i < _navPath.corners.Length - 1; i++)
+                remainingDistance += Vector3.Distance(_navPath.corners[i], _navPath.corners[i + 1]);
+
+            return true;
+        }
+
         /// <summary>
         /// NavMesh GPS — priority: nearest enemy > unactivated checkpoint > level exit.
         /// Also sets NavMeshAgent destination on ActionExecutor.
@@ -297,7 +416,7 @@ namespace UltrabotMod
         private void WriteNavHint(float[] obs, ref int idx, Vector3 playerPos, List<EnemyIdentifier> enemies)
         {
             int frame = Time.frameCount;
-            bool shouldQuery = (frame - _navQueryFrame) >= 10;
+            bool shouldQuery = (frame - _navQueryFrame) >= NavQueryIntervalFrames;
 
             if (shouldQuery)
             {
@@ -313,30 +432,46 @@ namespace UltrabotMod
                     foundTarget = true;
                 }
 
-                // Priority 2: nearest unactivated checkpoint
+                // Priority 2: nearest unactivated checkpoint (forward-biased)
                 if (!foundTarget && _checkpoints != null)
                 {
-                    float bestDist = float.MaxValue;
+                    float bestScore = float.MinValue;
                     foreach (var cp in _checkpoints)
                     {
                         if (cp == null || cp.activated) continue;
                         float d = Vector3.Distance(playerPos, cp.transform.position);
-                        if (d < bestDist)
+                        float fwdDot = Vector3.Dot(_player.transform.forward, (cp.transform.position - playerPos).normalized);
+                        float score = -d + fwdDot * 5f;
+                        if (score > bestScore)
                         {
-                            bestDist = d;
+                            bestScore = score;
                             target = cp.transform.position;
                             foundTarget = true;
                         }
                     }
                 }
 
-                // Priority 3: try to find level exit (FinalDoor)
+                // Priority 3: try to find level exit (FinalDoor, forward-biased)
                 if (!foundTarget)
                 {
-                    var door = Object.FindObjectOfType<FinalDoor>();
-                    if (door != null)
+                    FinalDoor[] doors = Object.FindObjectsOfType<FinalDoor>();
+                    FinalDoor bestDoor = null;
+                    float bestDoorScore = float.MinValue;
+                    foreach (var d in doors)
                     {
-                        target = door.transform.position;
+                        if (d == null) continue;
+                        float dist = Vector3.Distance(playerPos, d.transform.position);
+                        float fwdDot = Vector3.Dot(_player.transform.forward, (d.transform.position - playerPos).normalized);
+                        float score = -dist + fwdDot * 5f;
+                        if (score > bestDoorScore)
+                        {
+                            bestDoorScore = score;
+                            bestDoor = d;
+                        }
+                    }
+                    if (bestDoor != null)
+                    {
+                        target = bestDoor.transform.position;
                         foundTarget = true;
                     }
                 }
@@ -344,35 +479,232 @@ namespace UltrabotMod
                 // Compute path FIRST — only arm executor steering if path is valid.
                 bool pathOk = false;
                 Vector3 nextCorner = Vector3.zero;
+                float remainingDistance = 0f;
                 if (foundTarget)
                 {
                     NavMeshHit navHit;
                     Vector3 navStart = playerPos;
                     Vector3 navEnd = target;
 
-                    if (NavMesh.SamplePosition(playerPos, out navHit, 5f, NavMesh.AllAreas))
+                    if (NavMesh.SamplePosition(playerPos, out navHit, NavSampleRadius, NavMesh.AllAreas))
                         navStart = navHit.position;
-                    if (NavMesh.SamplePosition(target, out navHit, 5f, NavMesh.AllAreas))
+                    if (NavMesh.SamplePosition(target, out navHit, NavSampleRadius, NavMesh.AllAreas))
                         navEnd = navHit.position;
 
                     if (NavMesh.CalculatePath(navStart, navEnd, NavMesh.AllAreas, _navPath)
-                        && _navPath.status == NavMeshPathStatus.PathComplete
-                        && _navPath.corners.Length >= 2)
+                        && (_navPath.status == NavMeshPathStatus.PathComplete
+                            || _navPath.status == NavMeshPathStatus.PathPartial)
+                        && _navPath.corners.Length >= 2
+                        && TryGetSteeringCorner(playerPos, out nextCorner, out remainingDistance))
                     {
-                        nextCorner = _navPath.corners[1];
                         Vector3 dir = (nextCorner - playerPos).normalized;
-
-                        float totalDist = 0f;
-                        for (int i = 0; i < _navPath.corners.Length - 1; i++)
-                            totalDist += Vector3.Distance(_navPath.corners[i], _navPath.corners[i + 1]);
 
                         _cachedNavDirX = dir.x;
                         _cachedNavDirY = dir.y;
                         _cachedNavDirZ = dir.z;
-                        _cachedNavDist = Mathf.Clamp01(totalDist / 200f);
+                        _cachedNavDist = Mathf.Clamp01(remainingDistance / 200f);
                         _cachedNavHasPath = 1f;
                         pathOk = true;
                     }
+                }
+
+                if (!pathOk)
+                {
+                    TryOpenNearbyDoors(playerPos, _player.transform.forward);
+
+                    if (foundTarget)
+                    {
+                        // No valid NavMesh path but we know the target.
+                        // Use straight-line direction so the bot pushes toward
+                        // the door instead of going aimless/backward.
+                        // This also ensures the bot physically triggers DoorController.
+                        Vector3 fallback = target - playerPos;
+                        fallback.y = 0f;
+                        float fbDist = fallback.magnitude;
+                        if (fbDist > 0.1f)
+                        {
+                            fallback /= fbDist;
+                            _cachedNavDirX = fallback.x;
+                            _cachedNavDirY = 0f;
+                            _cachedNavDirZ = fallback.z;
+                            _cachedNavDist = Mathf.Clamp01(fbDist / 200f);
+                            _cachedNavHasPath = 0f; // 0 = no real path, just hint
+                        }
+                        else
+                        {
+                            _cachedNavDirX = 0f;
+                            _cachedNavDirY = 0f;
+                            _cachedNavDirZ = 0f;
+                            _cachedNavDist = 1f;
+                            _cachedNavHasPath = 0f;
+                        }
+                    }
+                    else
+                    {
+                        _cachedNavDirX = 0f;
+                        _cachedNavDirY = 0f;
+                        _cachedNavDirZ = 0f;
+                        _cachedNavDist = 1f;
+                        _cachedNavHasPath = 0f;
+                    }
+                }
+
+                // Steering target = next corner if path valid,
+                // fallback = straight line to target if path blocked,
+                // clear = no target at all.
+                if (_actionExecutor != null)
+                {
+                    if (pathOk)
+                        _actionExecutor.SetNavDestination(nextCorner);
+                    else if (foundTarget)
+                        _actionExecutor.SetNavDestination(target); // straight-line fallback
+                    else
+                        _actionExecutor.ClearNavDestination();
+                }
+            }
+
+            obs[idx++] = _cachedNavDirX;
+            obs[idx++] = _cachedNavDirY;
+            obs[idx++] = _cachedNavDirZ;
+            obs[idx++] = _cachedNavDist;
+            obs[idx++] = _cachedNavHasPath;
+        }
+
+        private void TryOpenNearbyDoors(Vector3 playerPos, Vector3 playerForward)
+        {
+            if (!EnsureDoorReflection())
+                return;
+
+            int frame = Time.frameCount;
+            if (_cachedDoors == null || (frame - _doorCacheFrame) >= DoorCacheIntervalFrames)
+            {
+                _doorCacheFrame = frame;
+                _cachedDoors = Object.FindObjectsOfType(_doorType);
+            }
+
+            if (_cachedDoors == null || _doorOpenField == null || _doorLockedField == null || _doorOpenMethod == null)
+                return;
+
+            Vector3 forward = playerForward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.0001f)
+                forward = Vector3.forward;
+            forward.Normalize();
+
+            for (int i = 0; i < _cachedDoors.Length; i++)
+            {
+                var door = _cachedDoors[i];
+                var doorComponent = door as Component;
+                if (door == null || doorComponent == null)
+                    continue;
+
+                object openValue = _doorOpenField.GetValue(door);
+                if (openValue is bool isOpen && isOpen)
+                    continue;
+
+                object lockedValue = _doorLockedField.GetValue(door);
+                if (lockedValue is bool isLocked && isLocked)
+                    continue;
+
+                Vector3 toDoor = doorComponent.transform.position - playerPos;
+                float distance = toDoor.magnitude;
+                if (distance <= 0.01f || distance > DoorOpenDistance)
+                    continue;
+
+                Vector3 toDoorDir = toDoor / distance;
+                if (Vector3.Dot(toDoorDir, forward) <= 0.3f)
+                    continue;
+
+                _doorOpenMethod.Invoke(door, new object[] { false, false });
+            }
+        }
+
+        private bool EnsureDoorReflection()
+        {
+            if (_doorType != null && _doorOpenField != null && _doorLockedField != null && _doorOpenMethod != null)
+                return true;
+
+            if (_doorReflectionResolved)
+                return false;
+
+            _doorReflectionResolved = true;
+            _doorType = Type.GetType("Door");
+
+            if (_doorType == null)
+            {
+                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                for (int i = 0; i < assemblies.Length && _doorType == null; i++)
+                {
+                    Type[] types;
+                    try
+                    {
+                        types = assemblies[i].GetTypes();
+                    }
+                    catch (ReflectionTypeLoadException ex)
+                    {
+                        types = ex.Types;
+                    }
+
+                    if (types == null)
+                        continue;
+
+                    for (int j = 0; j < types.Length; j++)
+                    {
+                        var candidate = types[j];
+                        if (candidate != null && candidate.Name == "Door")
+                        {
+                            _doorType = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (_doorType == null)
+                return false;
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            _doorOpenField = _doorType.GetField("open", flags);
+            _doorLockedField = _doorType.GetField("locked", flags);
+            _doorOpenMethod = _doorType.GetMethod("Open", flags, null, new[] { typeof(bool), typeof(bool) }, null);
+            return _doorOpenField != null && _doorLockedField != null && _doorOpenMethod != null;
+        }
+
+        private void WriteSmartNavHint(float[] obs, ref int idx, Vector3 playerPos, List<EnemyIdentifier> enemies)
+        {
+            int frame = Time.frameCount;
+            bool shouldQuery = (frame - _navQueryFrame) >= 10;
+
+            if (shouldQuery)
+            {
+                _navQueryFrame = frame;
+                if (_navScratchPath == null)
+                    _navScratchPath = new NavMeshPath();
+
+                bool pathOk = false;
+                Vector3 nextCorner = Vector3.zero;
+                Vector3 lookDir = _player != null ? _player.transform.forward : Vector3.forward;
+
+                UpdateForwardProgress(playerPos);
+
+                NavTargetChoice choice;
+                bool suppressBackward = Time.unscaledTime < _backwardTargetSuppressUntil;
+                if (TrySelectNavTarget(playerPos, lookDir, enemies, true, suppressBackward, out choice)
+                    || (suppressBackward && TrySelectNavTarget(playerPos, lookDir, enemies, true, false, out choice))
+                    || TrySelectNavTarget(playerPos, lookDir, enemies, false, suppressBackward, out choice)
+                    || (suppressBackward && TrySelectNavTarget(playerPos, lookDir, enemies, false, false, out choice)))
+                {
+                    nextCorner = choice.NextCorner;
+                    Vector3 dir = (nextCorner - playerPos).normalized;
+
+                    _cachedNavDirX = dir.x;
+                    _cachedNavDirY = dir.y;
+                    _cachedNavDirZ = dir.z;
+                    _cachedNavDist = Mathf.Clamp01(choice.PathDistance / 200f);
+                    _cachedNavHasPath = 1f;
+                    pathOk = true;
+
+                    RecordNavTargetSelection(playerPos, lookDir, choice.Target);
                 }
 
                 if (!pathOk)
@@ -384,8 +716,6 @@ namespace UltrabotMod
                     _cachedNavHasPath = 0f;
                 }
 
-                // Steering target = next corner if path valid, otherwise CLEAR
-                // (RL gets full control instead of being pulled at unreachable target).
                 if (_actionExecutor != null)
                 {
                     if (pathOk)
@@ -400,6 +730,306 @@ namespace UltrabotMod
             obs[idx++] = _cachedNavDirZ;
             obs[idx++] = _cachedNavDist;
             obs[idx++] = _cachedNavHasPath;
+        }
+
+        private bool TrySelectNavTarget(Vector3 playerPos, Vector3 lookDir, List<EnemyIdentifier> enemies, bool requireForwardProgress, bool suppressBackwardHemisphere, out NavTargetChoice choice)
+        {
+            if (TrySelectEnemyTarget(playerPos, lookDir, enemies, requireForwardProgress, suppressBackwardHemisphere, out choice))
+                return true;
+
+            if (TrySelectCheckpointTarget(playerPos, lookDir, requireForwardProgress, suppressBackwardHemisphere, out choice))
+                return true;
+
+            if (TrySelectExitTarget(playerPos, lookDir, suppressBackwardHemisphere, out choice))
+                return true;
+
+            choice = default(NavTargetChoice);
+            return false;
+        }
+
+        private bool TrySelectEnemyTarget(Vector3 playerPos, Vector3 lookDir, List<EnemyIdentifier> enemies, bool requireForwardProgress, bool suppressBackwardHemisphere, out NavTargetChoice choice)
+        {
+            bool found = false;
+            choice = default(NavTargetChoice);
+
+            foreach (var enemy in enemies)
+            {
+                if (enemy == null)
+                    continue;
+
+                Vector3 targetPos = enemy.transform.position;
+                if (requireForwardProgress && IsBehindForwardProgress(targetPos))
+                    continue;
+
+                NavTargetChoice candidate;
+                if (!TryBuildNavTargetChoice(playerPos, lookDir, targetPos, out candidate))
+                    continue;
+
+                if (suppressBackwardHemisphere && !candidate.IsForwardHemisphere)
+                    continue;
+
+                if (!found || IsBetterNavChoice(candidate, choice))
+                {
+                    choice = candidate;
+                    found = true;
+                }
+            }
+
+            return found;
+        }
+
+        private bool TrySelectCheckpointTarget(Vector3 playerPos, Vector3 lookDir, bool requireForwardProgress, bool suppressBackwardHemisphere, out NavTargetChoice choice)
+        {
+            bool found = false;
+            choice = default(NavTargetChoice);
+
+            if (_checkpoints == null)
+                return false;
+
+            foreach (var checkpoint in _checkpoints)
+            {
+                if (checkpoint == null || checkpoint.activated)
+                    continue;
+
+                Vector3 targetPos = checkpoint.transform.position;
+                if (requireForwardProgress && IsBehindForwardProgress(targetPos))
+                    continue;
+
+                NavTargetChoice candidate;
+                if (!TryBuildNavTargetChoice(playerPos, lookDir, targetPos, out candidate))
+                    continue;
+
+                if (suppressBackwardHemisphere && !candidate.IsForwardHemisphere)
+                    continue;
+
+                if (!found || IsBetterNavChoice(candidate, choice))
+                {
+                    choice = candidate;
+                    found = true;
+                }
+            }
+
+            return found;
+        }
+
+        private bool TrySelectExitTarget(Vector3 playerPos, Vector3 lookDir, bool suppressBackwardHemisphere, out NavTargetChoice choice)
+        {
+            bool found = false;
+            choice = default(NavTargetChoice);
+
+            var doors = Object.FindObjectsOfType<FinalDoor>();
+            foreach (var door in doors)
+            {
+                if (door == null)
+                    continue;
+
+                NavTargetChoice candidate;
+                if (!TryBuildNavTargetChoice(playerPos, lookDir, door.transform.position, out candidate))
+                    continue;
+
+                if (suppressBackwardHemisphere && !candidate.IsForwardHemisphere)
+                    continue;
+
+                if (!found || IsBetterNavChoice(candidate, choice))
+                {
+                    choice = candidate;
+                    found = true;
+                }
+            }
+
+            return found;
+        }
+
+        private bool TryBuildNavTargetChoice(Vector3 playerPos, Vector3 lookDir, Vector3 targetPos, out NavTargetChoice choice)
+        {
+            choice = default(NavTargetChoice);
+
+            Vector3 nextCorner;
+            float totalDist;
+            if (!TryCalculateNavPath(playerPos, targetPos, _navScratchPath, out nextCorner, out totalDist))
+                return false;
+
+            choice.Target = targetPos;
+            choice.NextCorner = nextCorner;
+            choice.PathDistance = totalDist;
+            choice.IsForwardHemisphere = IsForwardHemisphere(playerPos, lookDir, targetPos);
+            return true;
+        }
+
+        private bool TryCalculateNavPath(Vector3 playerPos, Vector3 targetPos, NavMeshPath path, out Vector3 nextCorner, out float totalDist)
+        {
+            nextCorner = Vector3.zero;
+            totalDist = 0f;
+
+            if (path == null)
+                return false;
+
+            NavMeshHit navHit;
+            Vector3 navStart = playerPos;
+            Vector3 navEnd = targetPos;
+
+            if (NavMesh.SamplePosition(playerPos, out navHit, 5f, NavMesh.AllAreas))
+                navStart = navHit.position;
+            if (NavMesh.SamplePosition(targetPos, out navHit, 5f, NavMesh.AllAreas))
+                navEnd = navHit.position;
+
+            if (!NavMesh.CalculatePath(navStart, navEnd, NavMesh.AllAreas, path)
+                || path.status != NavMeshPathStatus.PathComplete
+                || path.corners.Length < 2)
+                return false;
+
+            nextCorner = path.corners[1];
+            for (int i = 0; i < path.corners.Length - 1; i++)
+                totalDist += Vector3.Distance(path.corners[i], path.corners[i + 1]);
+            return true;
+        }
+
+        private bool IsBetterNavChoice(NavTargetChoice candidate, NavTargetChoice currentBest)
+        {
+            if (candidate.IsForwardHemisphere != currentBest.IsForwardHemisphere)
+                return candidate.IsForwardHemisphere;
+
+            return candidate.PathDistance < currentBest.PathDistance;
+        }
+
+        private bool IsForwardHemisphere(Vector3 playerPos, Vector3 lookDir, Vector3 targetPos)
+        {
+            Vector3 toTarget = targetPos - playerPos;
+            if (toTarget.sqrMagnitude < 0.001f || lookDir.sqrMagnitude < 0.001f)
+                return true;
+
+            return Vector3.Dot(toTarget.normalized, lookDir.normalized) > ForwardHemisphereDotThreshold;
+        }
+
+        private void UpdateForwardProgress(Vector3 playerPos)
+        {
+            if (_progressAxis == 0)
+            {
+                Vector3 delta = playerPos - _progressOrigin;
+                float absX = Mathf.Abs(delta.x);
+                float absZ = Mathf.Abs(delta.z);
+
+                if (absX >= ProgressLockDistance || absZ >= ProgressLockDistance)
+                {
+                    if (absX >= absZ)
+                    {
+                        _progressAxis = 1;
+                        _progressSign = delta.x >= 0f ? 1f : -1f;
+                    }
+                    else
+                    {
+                        _progressAxis = 2;
+                        _progressSign = delta.z >= 0f ? 1f : -1f;
+                    }
+                }
+            }
+
+            if (_progressAxis != 0)
+            {
+                float progress = GetSignedProgress(playerPos);
+                if (progress > _maxForwardProgress)
+                    _maxForwardProgress = progress;
+            }
+        }
+
+        private float GetSignedProgress(Vector3 position)
+        {
+            if (_progressAxis == 1)
+                return (position.x - _progressOrigin.x) * _progressSign;
+            if (_progressAxis == 2)
+                return (position.z - _progressOrigin.z) * _progressSign;
+            return 0f;
+        }
+
+        private bool IsBehindForwardProgress(Vector3 targetPos)
+        {
+            if (_progressAxis == 0 || _maxForwardProgress <= ProgressBehindBuffer)
+                return false;
+
+            return GetSignedProgress(targetPos) < (_maxForwardProgress - ProgressBehindBuffer);
+        }
+
+        private void RecordNavTargetSelection(Vector3 playerPos, Vector3 lookDir, Vector3 targetPos)
+        {
+            bool isBackward = !IsForwardHemisphere(playerPos, lookDir, targetPos);
+            float now = Time.unscaledTime;
+
+            if (_navTargetHistoryCount > 0)
+            {
+                int lastIndex = (_navTargetHistoryNextIndex + _navTargetHistory.Length - 1) % _navTargetHistory.Length;
+                var last = _navTargetHistory[lastIndex];
+                if ((last.Position - targetPos).sqrMagnitude < NavTargetChangeDistance * NavTargetChangeDistance
+                    && last.IsBackward == isBackward)
+                {
+                    last.Time = now;
+                    _navTargetHistory[lastIndex] = last;
+                }
+                else
+                {
+                    _navTargetHistory[_navTargetHistoryNextIndex] = new NavTargetHistoryEntry
+                    {
+                        Position = targetPos,
+                        Time = now,
+                        IsBackward = isBackward
+                    };
+                    _navTargetHistoryNextIndex = (_navTargetHistoryNextIndex + 1) % _navTargetHistory.Length;
+                    if (_navTargetHistoryCount < _navTargetHistory.Length)
+                        _navTargetHistoryCount++;
+                }
+            }
+            else
+            {
+                _navTargetHistory[0] = new NavTargetHistoryEntry
+                {
+                    Position = targetPos,
+                    Time = now,
+                    IsBackward = isBackward
+                };
+                _navTargetHistoryCount = 1;
+                _navTargetHistoryNextIndex = 1;
+            }
+
+            if (isBackward && CountRecentTargetAlternations(now) >= 4)
+                _backwardTargetSuppressUntil = now + NavBackwardSuppressSeconds;
+        }
+
+        private int CountRecentTargetAlternations(float now)
+        {
+            if (_navTargetHistoryCount < 2)
+                return 0;
+
+            int alternations = 0;
+            bool hasPrevious = false;
+            bool previousIsBackward = false;
+            Vector3 previousPosition = Vector3.zero;
+            int oldestIndex = (_navTargetHistoryNextIndex - _navTargetHistoryCount + _navTargetHistory.Length) % _navTargetHistory.Length;
+
+            for (int i = 0; i < _navTargetHistoryCount; i++)
+            {
+                int index = (oldestIndex + i) % _navTargetHistory.Length;
+                var entry = _navTargetHistory[index];
+                if (now - entry.Time > NavLoopWindowSeconds)
+                    continue;
+
+                if (!hasPrevious)
+                {
+                    hasPrevious = true;
+                    previousIsBackward = entry.IsBackward;
+                    previousPosition = entry.Position;
+                    continue;
+                }
+
+                if ((entry.Position - previousPosition).sqrMagnitude < NavTargetChangeDistance * NavTargetChangeDistance)
+                    continue;
+
+                if (entry.IsBackward != previousIsBackward)
+                    alternations++;
+
+                previousIsBackward = entry.IsBackward;
+                previousPosition = entry.Position;
+            }
+
+            return alternations;
         }
 
         /// <summary>

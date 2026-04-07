@@ -41,7 +41,13 @@ namespace UltrabotMod
         private FieldInfo _inputDirField;
 
         // Navigation target (set by GameStateReader)
+        private bool _hasNavTarget;
         private Vector3 _navTarget;
+        private Vector3 _lastNavDirection;
+        private Vector3 _lastNavSamplePosition;
+        private bool _hasNavSamplePosition;
+        private int _navStuckFrames;
+        private int _navRecoveryFrames;
 
         // Input system — we cache reflection metadata but get InputActionState FRESH each frame
         // because InputManager.InputSource is a property that may return different objects
@@ -56,6 +62,22 @@ namespace UltrabotMod
 
         // Edge detection
         private bool[] _prevButtons = new bool[ActionSize];
+
+        // === Anti-spam metrics, consumed by TcpBridge.CalculateReward each step ===
+        public float CameraJitter;
+        public float MoveJitter;
+        public int WastedActions;
+        public int DashUsed;
+        public int PunchUsed;
+        public int SlamTriggered;
+        public int WeaponSwitches;
+        public int WhiplashFired;
+        public int FireToggles;
+        public int ButtonsHeldCount;
+
+        // Previous-step raw inputs for jitter sign-flip detection
+        private float _prevRawYaw, _prevRawPitch;
+        private float _prevMoveFwd, _prevMoveRight;
 
         // Pending InputActionState — set in Execute() (coroutine), applied in ApplyPendingInputStates() (Update)
         private bool _hasPendingInputs;
@@ -79,6 +101,12 @@ namespace UltrabotMod
         private const int WhiplashCD = 30;
         private const int SlamCD = 30;
         private const int ChangeFistCD = 20;
+        private const float NavTargetCarryDistance = 1.5f;
+        private const float NavTargetReachDistance = 0.1f;
+        private const float NavStuckMinProgress = 0.05f;
+        private const float NavStuckMinSpeed = 0.08f;
+        private const int NavStuckFrameThreshold = 12;
+        private const int NavRecoveryCooldownFrames = 45;
         private const float WallSlideCheckDistance = 1f;
         private const float WallSlideRayHeight = 0.5f;
         private const float AimAssistPitchLimit = 20f;
@@ -100,15 +128,16 @@ namespace UltrabotMod
                     UltrabotPlugin.Log.LogError("[ULTRABOT] inputDir field NOT FOUND!");
             }
 
+            ClearNavDestination();
             SetupInputSystem();
         }
 
-        public bool IsNavAgentActive => _navTarget != Vector3.zero;
+        public bool IsNavAgentActive => _hasNavTarget;
         public float NavTargetDistance
         {
             get
             {
-                if (_player != null && _navTarget != Vector3.zero)
+                if (_player != null && _hasNavTarget)
                     return Vector3.Distance(_player.transform.position, _navTarget);
                 return 0f;
             }
@@ -120,13 +149,32 @@ namespace UltrabotMod
         /// </summary>
         public Vector3 GetNavDesiredDirection()
         {
-            if (_player != null && _navTarget != Vector3.zero)
+            if (_player != null && _hasNavTarget)
             {
                 Vector3 toTarget = _navTarget - _player.transform.position;
                 toTarget.y = 0;
-                if (toTarget.magnitude > 2f)
-                    return toTarget.normalized;
+
+                float dist = toTarget.magnitude;
+                if (dist > NavTargetReachDistance)
+                {
+                    Vector3 navDir = toTarget / dist;
+
+                    if (dist <= NavTargetCarryDistance && IsValidDirection(_lastNavDirection))
+                    {
+                        float carryWeight = 1f - Mathf.InverseLerp(NavTargetReachDistance, NavTargetCarryDistance, dist);
+                        Vector3 carriedDir = Vector3.Slerp(navDir, _lastNavDirection, carryWeight);
+                        if (IsValidDirection(carriedDir))
+                            navDir = carriedDir.normalized;
+                    }
+
+                    _lastNavDirection = navDir;
+                    return navDir;
+                }
+
+                if (IsValidDirection(_lastNavDirection))
+                    return _lastNavDirection;
             }
+
             return Vector3.zero;
         }
 
@@ -135,7 +183,25 @@ namespace UltrabotMod
         /// </summary>
         public void SetNavDestination(Vector3 target)
         {
+            if (!IsFiniteVector(target))
+            {
+                ClearNavDestination();
+                return;
+            }
+
+            _hasNavTarget = true;
             _navTarget = target;
+        }
+
+        public void ClearNavDestination()
+        {
+            _hasNavTarget = false;
+            _navTarget = Vector3.zero;
+            _lastNavDirection = Vector3.zero;
+            _lastNavSamplePosition = Vector3.zero;
+            _hasNavSamplePosition = false;
+            _navStuckFrames = 0;
+            _navRecoveryFrames = 0;
         }
 
         private void SetupInputSystem()
@@ -279,6 +345,76 @@ namespace UltrabotMod
             return IsFiniteVector(value) && value.sqrMagnitude > 0.0001f;
         }
 
+        private void ResetNavRecovery()
+        {
+            _navStuckFrames = 0;
+            _hasNavSamplePosition = false;
+        }
+
+        private bool IsNavMovementStuck(Vector3 moveDir)
+        {
+            if (_player == null || !_hasNavTarget || !IsValidDirection(moveDir))
+            {
+                ResetNavRecovery();
+                return false;
+            }
+
+            Vector3 currentPos = _player.transform.position;
+            currentPos.y = 0f;
+
+            if (!_hasNavSamplePosition)
+            {
+                _lastNavSamplePosition = currentPos;
+                _hasNavSamplePosition = true;
+                _navStuckFrames = 0;
+                return false;
+            }
+
+            float progress = Vector3.Distance(currentPos, _lastNavSamplePosition);
+            _lastNavSamplePosition = currentPos;
+
+            Vector3 velocity = _player.rb != null ? _player.rb.velocity : Vector3.zero;
+            velocity.y = 0f;
+
+            Vector3 toTarget = _navTarget - _player.transform.position;
+            toTarget.y = 0f;
+
+            bool pushingIntoObstacle =
+                toTarget.magnitude > NavTargetCarryDistance &&
+                velocity.magnitude < NavStuckMinSpeed &&
+                progress < NavStuckMinProgress;
+
+            _navStuckFrames = pushingIntoObstacle ? (_navStuckFrames + 1) : 0;
+            return _navStuckFrames >= NavStuckFrameThreshold;
+        }
+
+        private static Vector3 ResolveWallSlideDirection(Vector3 moveDir, Vector3 preferredDir, RaycastHit wallHit)
+        {
+            Vector3 wallNormal = wallHit.normal;
+            if (Mathf.Abs(wallNormal.y) >= 0.7f || !IsValidDirection(wallNormal))
+                return moveDir;
+
+            Vector3 slideDir = Vector3.ProjectOnPlane(moveDir, wallNormal);
+            if (IsValidDirection(slideDir))
+                return slideDir.normalized;
+
+            Vector3 tangentA = Vector3.Cross(Vector3.up, wallNormal);
+            Vector3 tangentB = -tangentA;
+
+            if (!IsValidDirection(tangentA))
+                return Vector3.zero;
+
+            tangentA.Normalize();
+            tangentB.Normalize();
+
+            if (!IsValidDirection(preferredDir))
+                return tangentA;
+
+            return Vector3.Dot(tangentA, preferredDir) >= Vector3.Dot(tangentB, preferredDir)
+                ? tangentA
+                : tangentB;
+        }
+
         public void Execute(float[] actions)
         {
             if (_player == null || _player.dead)
@@ -295,6 +431,18 @@ namespace UltrabotMod
             if (_whiplashCooldown > 0) _whiplashCooldown--;
             if (_slamCooldown > 0) _slamCooldown--;
             if (_changeFistCooldown > 0) _changeFistCooldown--;
+
+            // Reset per-step anti-spam metrics
+            CameraJitter = 0f;
+            MoveJitter = 0f;
+            WastedActions = 0;
+            DashUsed = 0;
+            PunchUsed = 0;
+            SlamTriggered = 0;
+            WeaponSwitches = 0;
+            WhiplashFired = 0;
+            FireToggles = 0;
+            ButtonsHeldCount = 0;
 
             // --- Find nearest enemy (used for aim assist + fire gate) ---
             _nearestEnemy = null;
@@ -316,6 +464,14 @@ namespace UltrabotMod
                 // RL look input
                 float rawYaw = actions[2] * LookSensitivity;
                 float rawPitch = actions[3] * LookSensitivity;
+
+                // Camera jitter: sign-flip on raw input = dither (camera stops moving, autoaim breaks)
+                if (rawYaw * _prevRawYaw < 0f)
+                    CameraJitter += Mathf.Abs(rawYaw - _prevRawYaw);
+                if (rawPitch * _prevRawPitch < 0f)
+                    CameraJitter += Mathf.Abs(rawPitch - _prevRawPitch);
+                _prevRawYaw = rawYaw;
+                _prevRawPitch = rawPitch;
 
                 // Soft aim assist — gently pull camera toward nearest enemy
                 float aimYaw = 0f, aimPitch = 0f;
@@ -370,6 +526,15 @@ namespace UltrabotMod
                 }
             }
 
+            // Move jitter: sign-flip on move axes
+            {
+                float mf = actions[0], mr = actions[1];
+                if (mf * _prevMoveFwd < 0f) MoveJitter += Mathf.Abs(mf - _prevMoveFwd);
+                if (mr * _prevMoveRight < 0f) MoveJitter += Mathf.Abs(mr - _prevMoveRight);
+                _prevMoveFwd = mf;
+                _prevMoveRight = mr;
+            }
+
             // --- Movement: nav direction + RL correction ---
             if (_player.activated && _inputDirField != null)
             {
@@ -384,12 +549,24 @@ namespace UltrabotMod
                 // NavMeshAgent desired direction (pathfinding to target)
                 var navDir = GetNavDesiredDirection();
 
+                // Tick recovery cooldown
+                if (_navRecoveryFrames > 0) _navRecoveryFrames--;
+
                 Vector3 moveDir;
+                bool inRecovery = _navRecoveryFrames > 0;
+
                 if (navDir.magnitude > 0.01f)
                 {
-                    // Blend: 60% nav direction + 40% RL direction
-                    // Bot follows navmesh path but RL can strafe/dodge
-                    moveDir = navDir * 0.6f + rlDir * 0.4f;
+                    if (inRecovery)
+                    {
+                        // Recovery mode: nav has full authority, RL cannot fight it
+                        moveDir = navDir;
+                    }
+                    else
+                    {
+                        // Normal: 80% nav + 20% RL strafe (nav is primary)
+                        moveDir = navDir * 0.8f + rlDir * 0.2f;
+                    }
                 }
                 else
                 {
@@ -400,17 +577,41 @@ namespace UltrabotMod
                 if (moveDir.magnitude > 1f)
                     moveDir.Normalize();
 
+                // Only run stuck detection when not already in recovery
+                bool isStuck = !inRecovery && IsNavMovementStuck(moveDir);
+                bool hasWallHit = false;
+                RaycastHit wallHit = new RaycastHit();
+
                 if (IsValidDirection(moveDir))
                 {
                     Vector3 rayOrigin = _player.transform.position + Vector3.up * WallSlideRayHeight;
-                    if (Physics.Raycast(rayOrigin, moveDir.normalized, out RaycastHit wallHit, WallSlideCheckDistance, ~0, QueryTriggerInteraction.Ignore))
+                    if (Physics.Raycast(rayOrigin, moveDir.normalized, out wallHit, WallSlideCheckDistance, ~0, QueryTriggerInteraction.Ignore))
                     {
-                        Vector3 wallNormal = wallHit.normal;
-                        if (Mathf.Abs(wallNormal.y) < 0.7f && IsValidDirection(wallNormal))
-                        {
-                            Vector3 slideDir = Vector3.ProjectOnPlane(moveDir, wallNormal);
-                            moveDir = IsValidDirection(slideDir) ? slideDir.normalized : Vector3.zero;
-                        }
+                        hasWallHit = true;
+                        moveDir = ResolveWallSlideDirection(moveDir, IsValidDirection(navDir) ? navDir : moveDir, wallHit);
+                    }
+                }
+
+                if (isStuck)
+                {
+                    // Start recovery cooldown — nav-only movement for NavRecoveryCooldownFrames
+                    _navRecoveryFrames = NavRecoveryCooldownFrames;
+                    ResetNavRecovery();
+
+                    if (hasWallHit)
+                    {
+                        moveDir = ResolveWallSlideDirection(
+                            IsValidDirection(navDir) ? navDir : moveDir,
+                            IsValidDirection(navDir) ? navDir : moveDir,
+                            wallHit);
+                    }
+                    else if (IsValidDirection(navDir))
+                    {
+                        Vector3 recoveryA = Vector3.Cross(Vector3.up, navDir).normalized;
+                        Vector3 recoveryB = -recoveryA;
+                        moveDir = Vector3.Dot(recoveryA, rlDir) >= Vector3.Dot(recoveryB, rlDir)
+                            ? recoveryA
+                            : recoveryB;
                     }
                 }
 
@@ -465,38 +666,111 @@ namespace UltrabotMod
                 _pChangeFist = changeFist && !_prevButtons[19] && _changeFistCooldown <= 0;
                 _pChangeFistReleased = !changeFist && _prevButtons[19];
                 _hasPendingInputs = true;
+
+                // === Success / waste accounting (press-edges only) ===
+                // JUMP
+                if (jump && !_prevButtons[4])
+                {
+                    if (!_player.activated) WastedActions++;
+                }
+                // DASH — boost bank must be >= 100
+                if (dash && !_prevButtons[5])
+                {
+                    if (_player.boostCharge >= 100f) DashUsed++;
+                    else WastedActions++;
+                }
+                // PUNCH — fist must be ready
+                if (punch && !_prevButtons[9])
+                {
+                    bool ready = _fistControl != null
+                        && _fistControl.currentPunch != null
+                        && _fistControl.currentPunch.ready
+                        && _fistControl.fistCooldown <= 0f;
+                    if (ready) PunchUsed++;
+                    else WastedActions++;
+                }
+                // WHIPLASH — HookArm must be equipped
+                if (whiplash && !_prevButtons[16])
+                {
+                    if (_hookArm != null && _hookArm.equipped) WhiplashFired++;
+                    else WastedActions++;
+                }
             }
 
             // SLAM — trigger via Slide InputActionState while falling
             // The game handles slam internally when it sees Slide + player.falling
-            // Slamdown(1f) is wrong — it just stops movement in air
-            if (slam && !_prevButtons[17] && _player.falling)
+            if (slam && !_prevButtons[17])
             {
-                _pSlide = true; // will be applied via Harmony prefix
+                if (_player.falling)
+                {
+                    _pSlide = true; // will be applied via Harmony prefix
+                    SlamTriggered++;
+                }
+                else
+                {
+                    WastedActions++;
+                }
             }
+
+            // Anti-pattern: jump+slide simultaneously = airborne slide = Slamdown
+            if (jump && slide && !_prevButtons[4] && !_prevButtons[6])
+                SlamTriggered++;
 
             // WEAPON SLOTS
-            if (_gunControl != null && _weaponSwitchCooldown <= 0)
+            if (_gunControl != null)
             {
-                for (int slot = 0; slot < 6; slot++)
+                if (_weaponSwitchCooldown <= 0)
                 {
-                    if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                    bool switched = false;
+                    for (int slot = 0; slot < 6; slot++)
                     {
-                        _gunControl.SwitchWeapon(slot, null, true, false, false);
+                        if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                        {
+                            if (slot == _gunControl.currentSlotIndex)
+                            {
+                                WastedActions++;
+                            }
+                            else
+                            {
+                                _gunControl.SwitchWeapon(slot, null, true, false, false);
+                                _weaponSwitchCooldown = WeaponCD;
+                                WeaponSwitches++;
+                                switched = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!switched && swapVar && !_prevButtons[18] && _weaponSwitchCooldown <= 0)
+                    {
+                        int nextVar = (_gunControl.currentVariationIndex + 1);
+                        _gunControl.SwitchWeapon(
+                            _gunControl.currentSlotIndex, nextVar,
+                            false, false, true);
                         _weaponSwitchCooldown = WeaponCD;
-                        break;
+                        WeaponSwitches++;
                     }
                 }
-
-                if (swapVar && !_prevButtons[18] && _weaponSwitchCooldown <= 0)
+                else
                 {
-                    int nextVar = (_gunControl.currentVariationIndex + 1);
-                    _gunControl.SwitchWeapon(
-                        _gunControl.currentSlotIndex, nextVar,
-                        false, false, true);
-                    _weaponSwitchCooldown = WeaponCD;
+                    // On cooldown but pressed: count wasted edges
+                    for (int slot = 0; slot < 6; slot++)
+                        if (actions[10 + slot] > 0.5f && !_prevButtons[10 + slot])
+                            WastedActions++;
+                    if (swapVar && !_prevButtons[18])
+                        WastedActions++;
                 }
             }
+
+            // FireToggles & ButtonsHeldCount
+            if (firePrimary != _prevButtons[7]) FireToggles++;
+            if (fireSecondary != _prevButtons[8]) FireToggles++;
+
+            ButtonsHeldCount = (jump ? 1 : 0) + (dash ? 1 : 0) + (slide ? 1 : 0)
+                + (firePrimary ? 1 : 0) + (fireSecondary ? 1 : 0) + (punch ? 1 : 0)
+                + (whiplash ? 1 : 0) + (slam ? 1 : 0) + (swapVar ? 1 : 0) + (changeFist ? 1 : 0);
+            for (int s = 0; s < 6; s++)
+                if (actions[10 + s] > 0.5f) ButtonsHeldCount++;
 
             // Save button states for edge detection
             for (int i = 0; i < ActionSize; i++)
@@ -550,6 +824,10 @@ namespace UltrabotMod
             _prevActionStatesByName.Clear();
             _smoothYaw = 0f;
             _smoothPitch = 0f;
+            _prevRawYaw = 0f;
+            _prevRawPitch = 0f;
+            _prevMoveFwd = 0f;
+            _prevMoveRight = 0f;
 
             if (_player != null && _inputDirField != null)
                 _inputDirField.SetValue(_player, Vector3.zero);

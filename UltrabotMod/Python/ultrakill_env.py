@@ -29,6 +29,19 @@ PER_PROJECTILE = 8
 OBS_SIZE = PLAYER_FEATURES + SPATIAL_FEATURES + MAX_ENEMIES * PER_ENEMY + MAX_PROJECTILES * PER_PROJECTILE
 # 44 + 33 + 100 + 64 = 241
 
+# Reward-shaping slices follow the actual GetObservation() write order in C#.
+_BASE_PLAYER_STATE_FEATURES = 38
+_ENEMY_FACING_FEATURES = 3
+VEL_SLICE = slice(3, 6)
+LOOK_SLICE = slice(6, 9)
+NAV_START = _BASE_PLAYER_STATE_FEATURES + _ENEMY_FACING_FEATURES + NUM_RAYS
+NAV_DIR_SLICE = slice(NAV_START, NAV_START + 3)
+NAV_HAS_PATH_IDX = NAV_START + 4
+
+BACKWARD_NAV_PENALTY = -0.005
+BACKWARD_VELOCITY_DOT_THRESHOLD = -0.35
+NAV_FORWARD_DOT_THRESHOLD = 0.2
+
 # Must match C# ActionExecutor.ActionSize
 # Layout: [0-1] move, [2-3] look, [4] jump, [5] dash, [6] slide,
 # [7-8] fire1/fire2, [9] punch, [10-15] weapon slots, [16] whiplash,
@@ -82,6 +95,7 @@ class UltrakillEnv(gym.Env):
 
         self._sock: socket.socket | None = None
         self._steps = 0
+        self._last_forward_dir: np.ndarray | None = None
 
     def _connect(self) -> None:
         """Connect to the game's TCP bridge."""
@@ -141,6 +155,7 @@ class UltrakillEnv(gym.Env):
 
         # Receive initial observation
         obs = self._recv_observation()
+        self._update_last_forward_dir(obs)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
@@ -153,6 +168,10 @@ class UltrakillEnv(gym.Env):
 
         # Receive response
         obs, reward, done, info = self._recv_step_response()
+        reward, backward_penalty = self._apply_backward_nav_penalty(obs, reward)
+        if backward_penalty != 0.0:
+            info["backward_nav_penalty"] = backward_penalty
+        self._update_last_forward_dir(obs)
 
         truncated = self._steps >= self.max_episode_steps
         return obs, reward, done, truncated, info
@@ -208,3 +227,42 @@ class UltrakillEnv(gym.Env):
             "rank_index": rank_index,
         }
         return obs, reward, done, info
+
+    @staticmethod
+    def _normalize_horizontal(vec: np.ndarray) -> np.ndarray | None:
+        flat = np.array(vec, dtype=np.float32, copy=True)
+        if flat.shape[0] != 3:
+            return None
+        flat[1] = 0.0
+        norm = np.linalg.norm(flat)
+        if norm < 1e-6:
+            return None
+        return flat / norm
+
+    def _update_last_forward_dir(self, obs: np.ndarray) -> None:
+        if obs.shape[0] < LOOK_SLICE.stop:
+            return
+
+        look_dir = self._normalize_horizontal(obs[LOOK_SLICE])
+        if look_dir is not None:
+            self._last_forward_dir = look_dir
+
+    def _apply_backward_nav_penalty(self, obs: np.ndarray, reward: float) -> tuple[float, float]:
+        if self._last_forward_dir is None:
+            return reward, 0.0
+
+        if obs.shape[0] <= NAV_HAS_PATH_IDX or obs[NAV_HAS_PATH_IDX] <= 0.5:
+            return reward, 0.0
+
+        vel_dir = self._normalize_horizontal(obs[VEL_SLICE])
+        nav_dir = self._normalize_horizontal(obs[NAV_DIR_SLICE])
+        if vel_dir is None or nav_dir is None:
+            return reward, 0.0
+
+        backward_dot = float(np.dot(vel_dir, self._last_forward_dir))
+        nav_forward_dot = float(np.dot(nav_dir, self._last_forward_dir))
+        if backward_dot < BACKWARD_VELOCITY_DOT_THRESHOLD and nav_forward_dot > NAV_FORWARD_DOT_THRESHOLD:
+            reward += BACKWARD_NAV_PENALTY
+            return reward, BACKWARD_NAV_PENALTY
+
+        return reward, 0.0
