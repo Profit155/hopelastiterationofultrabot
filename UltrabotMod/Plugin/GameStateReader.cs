@@ -231,7 +231,7 @@ namespace UltrabotMod
             WriteRaycasts(obs, ref idx, pos);
 
             // --- NavMesh hint (5 floats) — GPS to enemy or checkpoint ---
-            WriteSmartNavHint(obs, ref idx, pos, enemies);
+            WriteNavHint(obs, ref idx, pos, enemies);
 
             // --- Aim hint (4 floats) — tells RL where to look ---
             WriteAimHint(obs, ref idx, pos, enemies);
@@ -432,30 +432,46 @@ namespace UltrabotMod
                     foundTarget = true;
                 }
 
-                // Priority 2: nearest unactivated checkpoint
+                // Priority 2: nearest unactivated checkpoint (forward-biased)
                 if (!foundTarget && _checkpoints != null)
                 {
-                    float bestDist = float.MaxValue;
+                    float bestScore = float.MinValue;
                     foreach (var cp in _checkpoints)
                     {
                         if (cp == null || cp.activated) continue;
                         float d = Vector3.Distance(playerPos, cp.transform.position);
-                        if (d < bestDist)
+                        float fwdDot = Vector3.Dot(_player.transform.forward, (cp.transform.position - playerPos).normalized);
+                        float score = -d + fwdDot * 5f;
+                        if (score > bestScore)
                         {
-                            bestDist = d;
+                            bestScore = score;
                             target = cp.transform.position;
                             foundTarget = true;
                         }
                     }
                 }
 
-                // Priority 3: try to find level exit (FinalDoor)
+                // Priority 3: try to find level exit (FinalDoor, forward-biased)
                 if (!foundTarget)
                 {
-                    var door = Object.FindObjectOfType<FinalDoor>();
-                    if (door != null)
+                    FinalDoor[] doors = Object.FindObjectsOfType<FinalDoor>();
+                    FinalDoor bestDoor = null;
+                    float bestDoorScore = float.MinValue;
+                    foreach (var d in doors)
                     {
-                        target = door.transform.position;
+                        if (d == null) continue;
+                        float dist = Vector3.Distance(playerPos, d.transform.position);
+                        float fwdDot = Vector3.Dot(_player.transform.forward, (d.transform.position - playerPos).normalized);
+                        float score = -dist + fwdDot * 5f;
+                        if (score > bestDoorScore)
+                        {
+                            bestDoorScore = score;
+                            bestDoor = d;
+                        }
+                    }
+                    if (bestDoor != null)
+                    {
+                        target = bestDoor.transform.position;
                         foundTarget = true;
                     }
                 }
