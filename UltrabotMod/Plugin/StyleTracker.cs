@@ -125,4 +125,86 @@ namespace UltrabotMod
             StyleTracker.AccumulatedDamageTaken += damage;
         }
     }
+
+    // ============================================================
+    // Input Injection Patches
+    // ============================================================
+    // Problem: Our MonoBehaviour.Update() may run AFTER game scripts' Update().
+    // WasPerformedThisFrame checks are frame-sensitive — if we set PerformedFrame
+    // after the game already checked it, it's missed. Fire1/Fire2 work because
+    // weapons check IsPressed (persistent), not WasPerformedThisFrame.
+    //
+    // Fix: Harmony Prefix on key game scripts' Update() to apply our input BEFORE
+    // they read it. This guarantees correct timing regardless of execution order.
+
+    /// <summary>
+    /// Static holder for pending input actions.
+    /// Set by ActionExecutor/TestPanel, consumed by Harmony prefix patches.
+    /// </summary>
+    public static class InputInjector
+    {
+        // Callback set by UltrabotPlugin — applies all pending InputActionState changes
+        public static System.Action ApplyInputs;
+
+        // Track which frame we last applied, to avoid double-apply
+        public static int LastAppliedFrame = -1;
+
+        public static void TryApply()
+        {
+            if (ApplyInputs != null && LastAppliedFrame != Time.frameCount)
+            {
+                LastAppliedFrame = Time.frameCount;
+                ApplyInputs();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Prefix on NewMovement.Update — apply inputs before movement reads them.
+    /// This ensures Jump, Dodge, Slide WasPerformedThisFrame is set correctly.
+    /// </summary>
+    [HarmonyPatch(typeof(NewMovement), "Update")]
+    public static class NewMovement_Update_InputPrefix
+    {
+        static void Prefix()
+        {
+            InputInjector.TryApply();
+        }
+    }
+
+    /// <summary>
+    /// Prefix on GunControl.Update — apply inputs before weapon slot switching.
+    /// </summary>
+    [HarmonyPatch(typeof(GunControl), "Update")]
+    public static class GunControl_Update_InputPrefix
+    {
+        static void Prefix()
+        {
+            InputInjector.TryApply();
+        }
+    }
+
+    /// <summary>
+    /// Prefix on HookArm.Update — apply inputs before hook reads Hook state.
+    /// </summary>
+    [HarmonyPatch(typeof(HookArm), "Update")]
+    public static class HookArm_Update_InputPrefix
+    {
+        static void Prefix()
+        {
+            InputInjector.TryApply();
+        }
+    }
+
+    /// <summary>
+    /// Prefix on FistControl.Update — apply inputs before punch reads Punch state.
+    /// </summary>
+    [HarmonyPatch(typeof(FistControl), "Update")]
+    public static class FistControl_Update_InputPrefix
+    {
+        static void Prefix()
+        {
+            InputInjector.TryApply();
+        }
+    }
 }

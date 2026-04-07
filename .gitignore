@@ -1,0 +1,25 @@
+# Build artifacts
+UltrabotMod/Plugin/bin/
+UltrabotMod/Plugin/obj/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+UltrabotMod/Python/checkpoints/
+UltrabotMod/Python/logs/
+
+# Claude Code local state
+.claude/
+
+# .NET runtime artifacts
+UltrabotMod/Plugin/.dotnet/
+UltrabotMod/Plugin/.dotnet-home/
+UltrabotMod/Plugin/.appdata/
+
+# dll-inspector build artifacts
+dll-inspector/**/bin/
+dll-inspector/**/obj/
+
+# Personal notes
+myasks/

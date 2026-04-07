@@ -11,23 +11,24 @@ namespace UltrabotMod
         public const int PerEnemyFeatures = 10;
         public const int PerProjectileFeatures = 8;
 
-        // Raycasts: 12 horizontal rays (every 30deg) + 4 vertical (up/down/forward-down/back-down)
-        // + 8 diagonal = 24 total rays, each gives normalized distance (0-1)
         public const int NumRays = 24;
         public const float RayMaxDist = 30f;
 
-        // NavMesh hint: direction to next checkpoint (3) + distance (1) + hasPath (1)
+        // NavMesh hint: direction (3) + distance (1) + hasPath (1)
         public const int NavFeatures = 5;
 
-        // Player: 41 + Rays: 24 + Nav: 5 = 70
-        public const int PlayerFeatures = 41;
-        public const int SpatialFeatures = NumRays + NavFeatures; // 29
+        // Aim hint: yaw_delta (1) + pitch_delta (1) + has_target (1) + in_frustum (1)
+        public const int AimFeatures = 4;
+
+        // Player: 44 + Rays: 24 + Nav: 5 + Aim: 4 = 77
+        public const int PlayerFeatures = 44;
+        public const int SpatialFeatures = NumRays + NavFeatures + AimFeatures; // 33
 
         public const int TotalObsSize =
             PlayerFeatures + SpatialFeatures +
             MaxEnemies * PerEnemyFeatures +
             MaxProjectiles * PerProjectileFeatures;
-        // 41 + 29 + 100 + 64 = 234
+        // 44 + 33 + 100 + 64 = 241
 
         private NewMovement _player;
         private GunControl _gunControl;
@@ -35,13 +36,28 @@ namespace UltrabotMod
         private StyleHUD _styleHud;
         private StatsManager _statsManager;
         private StyleCalculator _styleCalc;
+        private FistControl _fistControl;
+        private CameraController _camera;
+
+        // ActionExecutor reference for NavMeshAgent destination updates
+        private ActionExecutor _actionExecutor;
 
         // Cached checkpoint target
         private CheckPoint[] _checkpoints;
         private NavMeshPath _navPath;
         private int _navQueryFrame;
 
+        // Cached nav hint values (reused on non-query frames)
+        private float _cachedNavDirX, _cachedNavDirY, _cachedNavDirZ;
+        private float _cachedNavDist = 1f;
+        private float _cachedNavHasPath;
+
         public bool IsReady => _player != null && !_player.dead;
+
+        public void SetActionExecutor(ActionExecutor executor)
+        {
+            _actionExecutor = executor;
+        }
 
         public void RefreshReferences()
         {
@@ -51,8 +67,20 @@ namespace UltrabotMod
             _styleHud = Object.FindObjectOfType<StyleHUD>();
             _statsManager = Object.FindObjectOfType<StatsManager>();
             _styleCalc = Object.FindObjectOfType<StyleCalculator>();
+            _fistControl = Object.FindObjectOfType<FistControl>();
+            _camera = Object.FindObjectOfType<CameraController>();
             _checkpoints = Object.FindObjectsOfType<CheckPoint>();
             _navPath = new NavMeshPath();
+
+            // Reset nav cache so new episode never sees stale previous-episode data
+            _navQueryFrame = 0;
+            _cachedNavDirX = 0f;
+            _cachedNavDirY = 0f;
+            _cachedNavDirZ = 0f;
+            _cachedNavDist = 1f;
+            _cachedNavHasPath = 0f;
+            if (_actionExecutor != null)
+                _actionExecutor.SetNavDestination(Vector3.zero);
         }
 
         public float[] GetObservation()
@@ -67,7 +95,7 @@ namespace UltrabotMod
             var vel = _player.rb.velocity;
             var look = _player.transform.forward;
 
-            // --- Player state (41 floats) ---
+            // --- Player state (44 floats) ---
             obs[idx++] = pos.x;
             obs[idx++] = pos.y;
             obs[idx++] = pos.z;
@@ -132,14 +160,20 @@ namespace UltrabotMod
             obs[idx++] = (_weaponCharges != null) ? 1f - _weaponCharges.raicharge : 1f;
             obs[idx++] = Mathf.Floor(_player.boostCharge / 100f) / 3f;
 
-            // --- Raycasts (24 floats) — "eyes" for walls/floors/gaps ---
+            // --- Enemy-facing features (3 floats) — helps bot learn to aim ---
+            var enemies = GatherEnemies(pos);
+            WriteEnemyFacing(obs, ref idx, pos, look, enemies);
+
+            // --- Raycasts (24 floats) ---
             WriteRaycasts(obs, ref idx, pos);
 
-            // --- NavMesh hint (5 floats) — "GPS" to next checkpoint ---
-            WriteNavHint(obs, ref idx, pos);
+            // --- NavMesh hint (5 floats) — GPS to enemy or checkpoint ---
+            WriteNavHint(obs, ref idx, pos, enemies);
+
+            // --- Aim hint (4 floats) — tells RL where to look ---
+            WriteAimHint(obs, ref idx, pos, enemies);
 
             // --- Enemies (100 floats) ---
-            var enemies = GatherEnemies(pos);
             for (int i = 0; i < MaxEnemies; i++)
             {
                 if (i < enemies.Count)
@@ -186,23 +220,48 @@ namespace UltrabotMod
         }
 
         /// <summary>
-        /// Cast 24 rays around the player to detect walls, floors, and gaps.
-        /// Layout:
-        ///   [0-11]  12 horizontal rays at eye level, every 30 degrees
-        ///   [12-15] 4 vertical: up, down, forward-down(45deg), back-down(45deg)
-        ///   [16-23] 8 diagonal rays (45deg up/down in cardinal directions)
-        /// Each value = normalized hit distance (0=touching wall, 1=nothing within range)
+        /// 3 floats: dot product with nearest enemy, distance, line-of-sight
         /// </summary>
+        private void WriteEnemyFacing(float[] obs, ref int idx, Vector3 pos, Vector3 look, List<EnemyIdentifier> enemies)
+        {
+            if (enemies.Count > 0)
+            {
+                var nearest = enemies[0];
+                Vector3 toEnemy = nearest.transform.position - pos;
+                float dist = toEnemy.magnitude;
+                Vector3 dirToEnemy = dist > 0.01f ? toEnemy / dist : Vector3.zero;
+
+                // Dot product: 1 = looking straight at, -1 = looking away
+                obs[idx++] = Vector3.Dot(look, dirToEnemy);
+                // Distance normalized
+                obs[idx++] = Mathf.Clamp01(dist / 100f);
+                // Line-of-sight: raycast to enemy
+                RaycastHit hit;
+                float los = 0f;
+                if (Physics.Raycast(pos + Vector3.up * 1.5f, dirToEnemy, out hit, dist + 1f))
+                {
+                    var eid = hit.collider.GetComponentInParent<EnemyIdentifier>();
+                    if (eid != null) los = 1f;
+                }
+                obs[idx++] = los;
+            }
+            else
+            {
+                obs[idx++] = 0f; // no enemy
+                obs[idx++] = 1f; // max distance
+                obs[idx++] = 0f; // no LOS
+            }
+        }
+
         private void WriteRaycasts(float[] obs, ref int idx, Vector3 pos)
         {
-            var eyePos = pos + Vector3.up * 1.5f; // approximate eye height
+            var eyePos = pos + Vector3.up * 1.5f;
             var forward = _player.transform.forward;
             forward.y = 0;
             if (forward.sqrMagnitude < 0.01f) forward = Vector3.forward;
             forward.Normalize();
-            var right = new Vector3(forward.z, 0, -forward.x); // perpendicular
+            var right = new Vector3(forward.z, 0, -forward.x);
 
-            // 12 horizontal rays every 30 degrees
             for (int i = 0; i < 12; i++)
             {
                 float angle = i * 30f;
@@ -210,18 +269,16 @@ namespace UltrabotMod
                 obs[idx++] = CastRay(eyePos, dir);
             }
 
-            // 4 vertical rays
-            obs[idx++] = CastRay(eyePos, Vector3.up);                          // ceiling
-            obs[idx++] = CastRay(pos, Vector3.down);                            // floor
-            obs[idx++] = CastRay(eyePos, (forward + Vector3.down).normalized);  // forward-down
-            obs[idx++] = CastRay(eyePos, (-forward + Vector3.down).normalized); // back-down
+            obs[idx++] = CastRay(eyePos, Vector3.up);
+            obs[idx++] = CastRay(pos, Vector3.down);
+            obs[idx++] = CastRay(eyePos, (forward + Vector3.down).normalized);
+            obs[idx++] = CastRay(eyePos, (-forward + Vector3.down).normalized);
 
-            // 8 diagonal rays (4 directions × up/down 45deg)
             Vector3[] cardinals = { forward, -forward, right, -right };
             foreach (var card in cardinals)
             {
-                obs[idx++] = CastRay(eyePos, (card + Vector3.up).normalized);   // up-diagonal
-                obs[idx++] = CastRay(eyePos, (card + Vector3.down).normalized); // down-diagonal
+                obs[idx++] = CastRay(eyePos, (card + Vector3.up).normalized);
+                obs[idx++] = CastRay(eyePos, (card + Vector3.down).normalized);
             }
         }
 
@@ -229,52 +286,42 @@ namespace UltrabotMod
         {
             RaycastHit hit;
             if (Physics.Raycast(origin, direction, out hit, RayMaxDist))
-                return hit.distance / RayMaxDist; // 0 = touching, ~1 = far
-            return 1f; // nothing hit = max distance
+                return hit.distance / RayMaxDist;
+            return 1f;
         }
 
         /// <summary>
-        /// Use Unity NavMesh to find direction to the nearest unactivated checkpoint.
-        /// Gives the bot a "GPS" that works through portals (since ULTRAKILL bakes
-        /// portal NavMeshLinks into the navmesh).
-        /// Returns: dirX, dirY, dirZ (normalized), distance (normalized), hasPath (0/1)
+        /// NavMesh GPS — priority: nearest enemy > unactivated checkpoint > level exit.
+        /// Also sets NavMeshAgent destination on ActionExecutor.
         /// </summary>
-        private void WriteNavHint(float[] obs, ref int idx, Vector3 playerPos)
+        private void WriteNavHint(float[] obs, ref int idx, Vector3 playerPos, List<EnemyIdentifier> enemies)
         {
-            // Only requery NavMesh every 10 frames for performance
             int frame = Time.frameCount;
             bool shouldQuery = (frame - _navQueryFrame) >= 10;
 
-            if (shouldQuery && _checkpoints != null && _checkpoints.Length > 0)
+            if (shouldQuery)
             {
                 _navQueryFrame = frame;
 
-                // Find nearest unactivated checkpoint
                 Vector3 target = Vector3.zero;
-                float bestDist = float.MaxValue;
                 bool foundTarget = false;
 
-                foreach (var cp in _checkpoints)
+                // Priority 1: nearest alive enemy
+                if (enemies.Count > 0)
                 {
-                    if (cp == null || cp.activated) continue;
-                    float d = Vector3.Distance(playerPos, cp.transform.position);
-                    if (d < bestDist)
-                    {
-                        bestDist = d;
-                        target = cp.transform.position;
-                        foundTarget = true;
-                    }
+                    target = enemies[0].transform.position;
+                    foundTarget = true;
                 }
 
-                if (!foundTarget)
+                // Priority 2: nearest unactivated checkpoint
+                if (!foundTarget && _checkpoints != null)
                 {
-                    // All checkpoints activated — try to find exit/door
-                    // Fall back to furthest checkpoint as general direction
+                    float bestDist = float.MaxValue;
                     foreach (var cp in _checkpoints)
                     {
-                        if (cp == null) continue;
+                        if (cp == null || cp.activated) continue;
                         float d = Vector3.Distance(playerPos, cp.transform.position);
-                        if (d > bestDist || !foundTarget)
+                        if (d < bestDist)
                         {
                             bestDist = d;
                             target = cp.transform.position;
@@ -283,9 +330,22 @@ namespace UltrabotMod
                     }
                 }
 
+                // Priority 3: try to find level exit (FinalDoor)
+                if (!foundTarget)
+                {
+                    var door = Object.FindObjectOfType<FinalDoor>();
+                    if (door != null)
+                    {
+                        target = door.transform.position;
+                        foundTarget = true;
+                    }
+                }
+
+                // Compute path FIRST — only arm executor steering if path is valid.
+                bool pathOk = false;
+                Vector3 nextCorner = Vector3.zero;
                 if (foundTarget)
                 {
-                    // Sample positions onto NavMesh
                     NavMeshHit navHit;
                     Vector3 navStart = playerPos;
                     Vector3 navEnd = target;
@@ -296,39 +356,109 @@ namespace UltrabotMod
                         navEnd = navHit.position;
 
                     if (NavMesh.CalculatePath(navStart, navEnd, NavMesh.AllAreas, _navPath)
+                        && _navPath.status == NavMeshPathStatus.PathComplete
                         && _navPath.corners.Length >= 2)
                     {
-                        // Direction to first path corner (next waypoint)
-                        Vector3 nextPoint = _navPath.corners[1];
-                        Vector3 dir = (nextPoint - playerPos).normalized;
+                        nextCorner = _navPath.corners[1];
+                        Vector3 dir = (nextCorner - playerPos).normalized;
 
-                        // Total path distance
                         float totalDist = 0f;
                         for (int i = 0; i < _navPath.corners.Length - 1; i++)
                             totalDist += Vector3.Distance(_navPath.corners[i], _navPath.corners[i + 1]);
 
-                        obs[idx++] = dir.x;
-                        obs[idx++] = dir.y;
-                        obs[idx++] = dir.z;
-                        obs[idx++] = Mathf.Clamp01(totalDist / 200f); // normalized
-                        obs[idx++] = 1f; // hasPath
-                        return;
+                        _cachedNavDirX = dir.x;
+                        _cachedNavDirY = dir.y;
+                        _cachedNavDirZ = dir.z;
+                        _cachedNavDist = Mathf.Clamp01(totalDist / 200f);
+                        _cachedNavHasPath = 1f;
+                        pathOk = true;
                     }
                 }
+
+                if (!pathOk)
+                {
+                    _cachedNavDirX = 0f;
+                    _cachedNavDirY = 0f;
+                    _cachedNavDirZ = 0f;
+                    _cachedNavDist = 1f;
+                    _cachedNavHasPath = 0f;
+                }
+
+                // Steering target = next corner if path valid, otherwise CLEAR
+                // (RL gets full control instead of being pulled at unreachable target).
+                if (_actionExecutor != null)
+                {
+                    if (pathOk)
+                        _actionExecutor.SetNavDestination(nextCorner);
+                    else
+                        _actionExecutor.SetNavDestination(Vector3.zero);
+                }
             }
-            else if (!shouldQuery)
+
+            obs[idx++] = _cachedNavDirX;
+            obs[idx++] = _cachedNavDirY;
+            obs[idx++] = _cachedNavDirZ;
+            obs[idx++] = _cachedNavDist;
+            obs[idx++] = _cachedNavHasPath;
+        }
+
+        /// <summary>
+        /// Aim hint (4 floats): yaw delta, pitch delta to nearest enemy, has_target, in_frustum.
+        /// Tells RL WHERE to look without forcing the camera.
+        /// </summary>
+        private void WriteAimHint(float[] obs, ref int idx, Vector3 playerPos, List<EnemyIdentifier> enemies)
+        {
+            if (_camera == null || enemies.Count == 0)
             {
-                // Reuse last frame's data (already in obs array from last write)
-                idx += NavFeatures;
+                obs[idx++] = 0f; // yaw delta
+                obs[idx++] = 0f; // pitch delta
+                obs[idx++] = 0f; // has_target
+                obs[idx++] = 0f; // in_frustum
                 return;
             }
 
-            // No path found — zero out
-            obs[idx++] = 0f;
-            obs[idx++] = 0f;
-            obs[idx++] = 0f;
-            obs[idx++] = 1f; // max distance = unknown
-            obs[idx++] = 0f; // no path
+            // Find nearest visible enemy (prefer LOS)
+            EnemyIdentifier target = enemies[0];
+
+            Vector3 toEnemy = target.transform.position - playerPos;
+            float dist = toEnemy.magnitude;
+            if (dist < 0.1f)
+            {
+                obs[idx++] = 0f;
+                obs[idx++] = 0f;
+                obs[idx++] = 1f;
+                obs[idx++] = 1f;
+                return;
+            }
+
+            // Calculate yaw and pitch deltas (how much camera needs to turn)
+            Vector3 dirToEnemy = toEnemy / dist;
+
+            // Current camera forward
+            float camYawRad = _camera.rotationY * Mathf.Deg2Rad;
+            float camPitchRad = _camera.rotationX * Mathf.Deg2Rad;
+            Vector3 camForward = new Vector3(
+                Mathf.Sin(camYawRad) * Mathf.Cos(camPitchRad),
+                -Mathf.Sin(camPitchRad),
+                Mathf.Cos(camYawRad) * Mathf.Cos(camPitchRad)
+            );
+
+            // Target yaw (horizontal angle)
+            float targetYaw = Mathf.Atan2(dirToEnemy.x, dirToEnemy.z) * Mathf.Rad2Deg;
+            float yawDelta = Mathf.DeltaAngle(_camera.rotationY, targetYaw);
+
+            // Target pitch (vertical angle)
+            float targetPitch = -Mathf.Asin(dirToEnemy.y) * Mathf.Rad2Deg;
+            float pitchDelta = targetPitch - _camera.rotationX;
+
+            // Normalize to [-1, 1] range (±180 yaw, ±90 pitch)
+            obs[idx++] = Mathf.Clamp(yawDelta / 180f, -1f, 1f);
+            obs[idx++] = Mathf.Clamp(pitchDelta / 90f, -1f, 1f);
+            obs[idx++] = 1f; // has_target
+
+            // Check if enemy is in camera frustum (rough check: dot product > 0.5 = ~60 degree cone)
+            float dot = Vector3.Dot(_player.transform.forward, dirToEnemy);
+            obs[idx++] = dot > 0.5f ? 1f : 0f;
         }
 
         public RewardInfo GetRewardInfo()

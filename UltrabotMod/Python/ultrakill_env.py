@@ -17,19 +17,23 @@ from gymnasium import spaces
 
 
 # Must match C# GameStateReader constants
-PLAYER_FEATURES = 41
+PLAYER_FEATURES = 44    # 41 base + 3 enemy-facing (dot, dist, LOS)
 NUM_RAYS = 24           # 12 horizontal + 4 vertical + 8 diagonal
 NAV_FEATURES = 5        # dirXYZ + distance + hasPath
-SPATIAL_FEATURES = NUM_RAYS + NAV_FEATURES  # 29
+AIM_FEATURES = 4        # yaw_delta + pitch_delta + has_target + in_frustum
+SPATIAL_FEATURES = NUM_RAYS + NAV_FEATURES + AIM_FEATURES  # 33
 MAX_ENEMIES = 10
 PER_ENEMY = 10
 MAX_PROJECTILES = 8
 PER_PROJECTILE = 8
 OBS_SIZE = PLAYER_FEATURES + SPATIAL_FEATURES + MAX_ENEMIES * PER_ENEMY + MAX_PROJECTILES * PER_PROJECTILE
-# 41 + 29 + 100 + 64 = 234
+# 44 + 33 + 100 + 64 = 241
 
 # Must match C# ActionExecutor.ActionSize
-ACTION_SIZE = 22
+# Layout: [0-1] move, [2-3] look, [4] jump, [5] dash, [6] slide,
+# [7-8] fire1/fire2, [9] punch, [10-15] weapon slots, [16] whiplash,
+# [17] slam, [18] swap_variation, [19] change_fist
+ACTION_SIZE = 20
 
 # Protocol message types
 MSG_STEP = 0
@@ -59,7 +63,7 @@ class UltrakillEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
 
         # Action space: 4 continuous (move_fwd, move_right, look_yaw, look_pitch)
-        # + 18 binary buttons
+        # + 16 binary buttons
         # We use Box for everything, threshold at 0.5 for buttons
         self.action_space = spaces.Box(
             low=-1.0,
@@ -157,10 +161,19 @@ class UltrakillEnv(gym.Env):
         if self._sock is not None:
             try:
                 self._send_msg(MSG_CLOSE)
+                time.sleep(0.1)  # give game time to process
             except Exception:
                 pass
-            self._sock.close()
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self._sock.close()
+            except Exception:
+                pass
             self._sock = None
+            print("[UltrakillEnv] Connection closed.")
 
     def get_level_info(self) -> str:
         """Request text info from the game (for LLM context)."""

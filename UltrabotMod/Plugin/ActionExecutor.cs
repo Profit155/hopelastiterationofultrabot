@@ -6,14 +6,10 @@ using UnityEngine;
 namespace UltrabotMod
 {
     /// <summary>
-    /// Hybrid action executor:
-    /// - Movement: via NewMovement.inputDir reflection (game's physics handles the rest)
-    /// - Camera: direct rotationX/Y with smoothing
-    /// - Discrete actions (jump/dash/slide/punch): direct calls WITH game-state checks
-    /// - Fire1/Fire2: via InputManager.InputSource.Fire1/Fire2 InputActionState
-    ///   (weapons read these in their Update() — this is the ONLY way to fire)
+    /// Action executor — all actions go through InputActionState (the game's input system)
+    /// except movement (inputDir) and camera (direct rotationX/Y).
     ///
-    /// Action layout (22 floats):
+    /// Action layout (20 floats):
     ///   [0]  move_forward   (-1 to 1)
     ///   [1]  move_right     (-1 to 1)
     ///   [2]  look_yaw       (-1 to 1) * sensitivity
@@ -25,17 +21,15 @@ namespace UltrabotMod
     ///   [8]  fire_secondary  (>0.5 = hold)
     ///   [9]  punch           (>0.5 = press)
     ///   [10-15] swap_weapon_1-6
-    ///   [16] coin_throw      (>0.5 = press)
-    ///   [17] whiplash        (>0.5 = press)
-    ///   [18] slam            (>0.5 = press)
-    ///   [19] swap_variation  (>0.5 = press)
-    ///   [20] rail_charge     (>0.5 = hold)
-    ///   [21] noop
+    ///   [16] whiplash        (>0.5 = press)
+    ///   [17] slam            (>0.5 = press)
+    ///   [18] swap_variation  (>0.5 = press)
+    ///   [19] change_fist     (>0.5 = press)
     /// </summary>
     public class ActionExecutor
     {
-        public const int ActionSize = 22;
-        public float LookSensitivity = 2f;
+        public const int ActionSize = 20;
+        public float LookSensitivity = 5f;
 
         private NewMovement _player;
         private GunControl _gunControl;
@@ -43,43 +37,52 @@ namespace UltrabotMod
         private CameraController _camera;
         private HookArm _hookArm;
 
-        // Reflection for private members
+        // Reflection for movement (no InputActionState for this)
         private FieldInfo _inputDirField;
-        private MethodInfo _dodgeMethod;
-        private MethodInfo _startSlideMethod;
 
-        // Fire injection via PlayerInput InputActionState fields
-        private object _playerInput; // InputManager.InputSource (PlayerInput object)
-        private InputActionState _fire1State;
-        private InputActionState _fire2State;
+        // Navigation target (set by GameStateReader)
+        private Vector3 _navTarget;
+
+        // Input system — we cache reflection metadata but get InputActionState FRESH each frame
+        // because InputManager.InputSource is a property that may return different objects
+        private InputManager _inputManager;
+        private PropertyInfo _inputSourceProp;
+        private Dictionary<string, FieldInfo> _actionFieldInfos = new Dictionary<string, FieldInfo>();
         private MethodInfo _setIsPressed;
         private MethodInfo _setPerformedFrame;
-        private bool _fireSystemReady;
-        private bool _loggedFireSetup;
+        private MethodInfo _setCanceledFrame;
+        private bool _inputSystemReady;
+        private bool _loggedSetup;
 
         // Edge detection
         private bool[] _prevButtons = new bool[ActionSize];
+
+        // Pending InputActionState — set in Execute() (coroutine), applied in ApplyPendingInputStates() (Update)
+        private bool _hasPendingInputs;
+        private bool _pJump, _pDash, _pSlide, _pPunch, _pFire1, _pFire2, _pHook;
+        private bool _pChangeFist, _pChangeFistReleased;
 
         // Camera smoothing
         private float _smoothYaw;
         private float _smoothPitch;
 
-        // Cooldowns (frames)
-        private int _jumpCooldown;
-        private int _dashCooldown;
-        private int _slideCooldown;
-        private int _punchCooldown;
+        // Cached nearest enemy (updated each frame for aim assist + fire gate)
+        private EnemyIdentifier _nearestEnemy;
+
+        // Cooldowns (frames) — safety nets on top of game's own checks
         private int _weaponSwitchCooldown;
         private int _whiplashCooldown;
         private int _slamCooldown;
+        private int _changeFistCooldown;
 
-        private const int JumpCD = 15;
-        private const int DashCD = 20;
-        private const int SlideCD = 30;
-        private const int PunchCD = 20;
         private const int WeaponCD = 60;
         private const int WhiplashCD = 30;
         private const int SlamCD = 30;
+        private const int ChangeFistCD = 20;
+        private const float WallSlideCheckDistance = 1f;
+        private const float WallSlideRayHeight = 0.5f;
+        private const float AimAssistPitchLimit = 20f;
+        private const float SafePitchLimit = 80f;
 
         public void RefreshReferences()
         {
@@ -91,77 +94,90 @@ namespace UltrabotMod
 
             if (_player != null)
             {
-                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
-                _inputDirField = typeof(NewMovement).GetField("inputDir", flags);
-                _dodgeMethod = typeof(NewMovement).GetMethod("Dodge", flags);
-                _startSlideMethod = typeof(NewMovement).GetMethod("StartSlide", flags);
-
+                _inputDirField = typeof(NewMovement).GetField("inputDir",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
                 if (_inputDirField == null)
                     UltrabotPlugin.Log.LogError("[ULTRABOT] inputDir field NOT FOUND!");
             }
 
-            // Setup fire injection
-            SetupFireSystem();
+            SetupInputSystem();
         }
 
-        private void SetupFireSystem()
+        public bool IsNavAgentActive => _navTarget != Vector3.zero;
+        public float NavTargetDistance
         {
-            if (_fireSystemReady) return;
+            get
+            {
+                if (_player != null && _navTarget != Vector3.zero)
+                    return Vector3.Distance(_player.transform.position, _navTarget);
+                return 0f;
+            }
+        }
+
+        /// <summary>
+        /// Get movement direction toward target (straight line).
+        /// GameStateReader provides the navmesh-calculated direction in observations.
+        /// </summary>
+        public Vector3 GetNavDesiredDirection()
+        {
+            if (_player != null && _navTarget != Vector3.zero)
+            {
+                Vector3 toTarget = _navTarget - _player.transform.position;
+                toTarget.y = 0;
+                if (toTarget.magnitude > 2f)
+                    return toTarget.normalized;
+            }
+            return Vector3.zero;
+        }
+
+        /// <summary>
+        /// Set navigation target — called by GameStateReader.
+        /// </summary>
+        public void SetNavDestination(Vector3 target)
+        {
+            _navTarget = target;
+        }
+
+        private void SetupInputSystem()
+        {
+            if (_inputSystemReady) return;
 
             try
             {
-                // InputManager is MonoSingleton — find it
-                var im = UnityEngine.Object.FindObjectOfType<InputManager>();
-                if (im == null)
+                _inputManager = UnityEngine.Object.FindObjectOfType<InputManager>();
+                if (_inputManager == null)
                 {
-                    if (!_loggedFireSetup)
+                    if (!_loggedSetup)
                         UltrabotPlugin.Log.LogError("[ULTRABOT] InputManager not found yet");
                     return;
                 }
 
-                // Get InputSource property (returns PlayerInput)
-                var inputSourceProp = typeof(InputManager).GetProperty("InputSource",
+                _inputSourceProp = typeof(InputManager).GetProperty("InputSource",
                     BindingFlags.Public | BindingFlags.Instance);
-                if (inputSourceProp == null)
+                if (_inputSourceProp == null)
                 {
                     UltrabotPlugin.Log.LogError("[ULTRABOT] InputSource property NOT FOUND");
                     return;
                 }
 
-                _playerInput = inputSourceProp.GetValue(im);
-                if (_playerInput == null)
+                // Get a sample to discover the PlayerInput type and fields
+                var sampleInput = _inputSourceProp.GetValue(_inputManager);
+                if (sampleInput == null)
                 {
-                    if (!_loggedFireSetup)
+                    if (!_loggedSetup)
                         UltrabotPlugin.Log.LogError("[ULTRABOT] InputSource is null (not ready yet)");
                     return;
                 }
 
-                var piType = _playerInput.GetType();
+                var piType = sampleInput.GetType();
 
-                // Get Fire1 and Fire2 fields (public InputActionState fields on PlayerInput)
-                var fire1Field = piType.GetField("Fire1", BindingFlags.Public | BindingFlags.Instance);
-                var fire2Field = piType.GetField("Fire2", BindingFlags.Public | BindingFlags.Instance);
-
-                if (fire1Field == null || fire2Field == null)
-                {
-                    UltrabotPlugin.Log.LogError($"[ULTRABOT] Fire1/Fire2 fields not found on {piType.Name}. Fields: {string.Join(", ", Array.ConvertAll(piType.GetFields(BindingFlags.Public | BindingFlags.Instance), f => f.Name))}");
-                    return;
-                }
-
-                _fire1State = fire1Field.GetValue(_playerInput) as InputActionState;
-                _fire2State = fire2Field.GetValue(_playerInput) as InputActionState;
-
-                if (_fire1State == null || _fire2State == null)
-                {
-                    UltrabotPlugin.Log.LogError("[ULTRABOT] Fire1/Fire2 InputActionState are null");
-                    return;
-                }
-
-                // Cache reflection for InputActionState private setters
+                // Cache InputActionState private setters (these never change)
                 var stateType = typeof(InputActionState);
                 _setIsPressed = stateType.GetMethod("set_IsPressed",
                     BindingFlags.NonPublic | BindingFlags.Instance);
                 _setPerformedFrame = stateType.GetMethod("set_PerformedFrame",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                _setCanceledFrame = stateType.GetMethod("set_CanceledFrame",
                     BindingFlags.NonPublic | BindingFlags.Instance);
 
                 if (_setIsPressed == null || _setPerformedFrame == null)
@@ -170,10 +186,26 @@ namespace UltrabotMod
                     return;
                 }
 
-                _fireSystemReady = true;
-                _loggedFireSetup = true;
+                // Cache FieldInfo for each action (metadata only, NOT the state objects)
+                string[] fieldNames = { "Fire1", "Fire2", "Jump", "Dodge", "Slide", "Punch", "Hook", "ChangeFist" };
+                _actionFieldInfos.Clear();
 
-                // Log all available InputActionState fields on PlayerInput
+                foreach (var name in fieldNames)
+                {
+                    var field = piType.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+                    if (field == null)
+                    {
+                        UltrabotPlugin.Log.LogError($"[ULTRABOT] PlayerInput.{name} NOT FOUND");
+                        return;
+                    }
+                    _actionFieldInfos[name] = field;
+                }
+
+                _prevActionStatesByName.Clear();
+                _inputSystemReady = true;
+                _loggedSetup = true;
+
+                // Log all available actions
                 var allFields = piType.GetFields(BindingFlags.Public | BindingFlags.Instance);
                 var actionNames = new List<string>();
                 foreach (var f in allFields)
@@ -182,24 +214,69 @@ namespace UltrabotMod
                         actionNames.Add(f.Name);
                 }
                 actionNames.Sort();
-                UltrabotPlugin.Log.LogError($"[ULTRABOT] Fire system READY! PlayerInput actions: {string.Join(", ", actionNames)}");
+                UltrabotPlugin.Log.LogError($"[ULTRABOT] Input system READY! Actions: {string.Join(", ", actionNames)}");
             }
             catch (Exception e)
             {
-                if (!_loggedFireSetup)
+                if (!_loggedSetup)
                 {
-                    UltrabotPlugin.Log.LogError($"[ULTRABOT] SetupFireSystem error: {e}");
-                    _loggedFireSetup = true;
+                    UltrabotPlugin.Log.LogError($"[ULTRABOT] SetupInputSystem error: {e}");
+                    _loggedSetup = true;
                 }
             }
         }
 
-        private void SetFireInput(InputActionState state, bool pressed)
+        /// <summary>
+        /// Get the CURRENT InputActionState for a named action.
+        /// Must be called each frame because InputManager.InputSource may return different objects.
+        /// </summary>
+        private InputActionState GetCurrentActionState(string name)
         {
+            if (_inputManager == null || _inputSourceProp == null) return null;
+            if (!_actionFieldInfos.TryGetValue(name, out var fieldInfo)) return null;
+
+            var currentInput = _inputSourceProp.GetValue(_inputManager);
+            if (currentInput == null) return null;
+
+            return fieldInfo.GetValue(currentInput) as InputActionState;
+        }
+
+        // Edge detection keyed by action NAME (not object ref, since objects change each frame)
+        private readonly Dictionary<string, bool> _prevActionStatesByName = new Dictionary<string, bool>();
+
+        /// <summary>
+        /// Set InputActionState by name. Gets the CURRENT state from InputManager.InputSource each call.
+        /// This is critical — InputSource may return different PlayerInput objects, so cached refs go stale.
+        /// </summary>
+        private void SetActionInput(string actionName, bool pressed)
+        {
+            var state = GetCurrentActionState(actionName);
             if (state == null || _setIsPressed == null) return;
+
+            bool wasPressed = _prevActionStatesByName.TryGetValue(actionName, out bool prev) && prev;
             _setIsPressed.Invoke(state, new object[] { pressed });
-            if (pressed)
+
+            if (pressed && !wasPressed)
                 _setPerformedFrame.Invoke(state, new object[] { Time.frameCount });
+            else if (!pressed && wasPressed && _setCanceledFrame != null)
+                _setCanceledFrame.Invoke(state, new object[] { Time.frameCount });
+
+            _prevActionStatesByName[actionName] = pressed;
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+
+        private static bool IsFiniteVector(Vector3 value)
+        {
+            return IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z);
+        }
+
+        private static bool IsValidDirection(Vector3 value)
+        {
+            return IsFiniteVector(value) && value.sqrMagnitude > 0.0001f;
         }
 
         public void Execute(float[] actions)
@@ -210,35 +287,90 @@ namespace UltrabotMod
                 if (_player == null) return;
             }
 
-            // Keep trying to get fire system ready
-            if (!_fireSystemReady)
-                SetupFireSystem();
+            if (!_inputSystemReady)
+                SetupInputSystem();
 
             // Tick cooldowns
-            if (_jumpCooldown > 0) _jumpCooldown--;
-            if (_dashCooldown > 0) _dashCooldown--;
-            if (_slideCooldown > 0) _slideCooldown--;
-            if (_punchCooldown > 0) _punchCooldown--;
             if (_weaponSwitchCooldown > 0) _weaponSwitchCooldown--;
             if (_whiplashCooldown > 0) _whiplashCooldown--;
             if (_slamCooldown > 0) _slamCooldown--;
+            if (_changeFistCooldown > 0) _changeFistCooldown--;
 
-            // --- Camera / Aiming (with smoothing) ---
+            // --- Find nearest enemy (used for aim assist + fire gate) ---
+            _nearestEnemy = null;
+            {
+                var enemies = UnityEngine.Object.FindObjectsOfType<EnemyIdentifier>();
+                float bestDist = float.MaxValue;
+                foreach (var e in enemies)
+                {
+                    if (e.dead || e.health <= 0) continue;
+                    float d = (e.transform.position - _player.transform.position).sqrMagnitude;
+                    if (d < bestDist) { bestDist = d; _nearestEnemy = e; }
+                }
+            }
+            var nearestEnemy = _nearestEnemy;
+
+            // --- Camera / Aiming: soft aim assist + RL control ---
             if (_camera != null)
             {
+                // RL look input
                 float rawYaw = actions[2] * LookSensitivity;
                 float rawPitch = actions[3] * LookSensitivity;
-                _smoothYaw = Mathf.Lerp(_smoothYaw, rawYaw, 0.3f);
-                _smoothPitch = Mathf.Lerp(_smoothPitch, rawPitch, 0.3f);
-                _camera.rotationX += _smoothYaw;
-                _camera.rotationY += _smoothPitch;
-                _camera.rotationY = Mathf.Clamp(
-                    _camera.rotationY,
-                    _camera.minimumY,
-                    _camera.maximumY);
+
+                // Soft aim assist — gently pull camera toward nearest enemy
+                float aimYaw = 0f, aimPitch = 0f;
+                if (nearestEnemy != null)
+                {
+                    Vector3 toEnemy = nearestEnemy.transform.position - _player.transform.position;
+                    float dist = IsFiniteVector(toEnemy) ? toEnemy.magnitude : 0f;
+                    if (dist > 0.5f && dist < 100f)
+                    {
+                        Vector3 dirH = Vector3.ProjectOnPlane(toEnemy, Vector3.up);
+                        float hDist = IsFiniteVector(dirH) ? dirH.magnitude : 0f;
+                        if (hDist > 0.1f)
+                        {
+                            // Yaw: horizontal aim toward enemy
+                            float targetYaw = Mathf.Atan2(dirH.x, dirH.z) * Mathf.Rad2Deg;
+                            if (IsFinite(targetYaw))
+                            {
+                                float yawDelta = Mathf.DeltaAngle(_camera.rotationY, targetYaw);
+                                if (IsFinite(yawDelta))
+                                    aimYaw = yawDelta * 0.10f;
+                            }
+
+                            // Pitch: only pull toward enemy, clamp to ±30° from horizon
+                            float vertAngle = Mathf.Atan2(toEnemy.y, hDist) * Mathf.Rad2Deg;
+                            if (IsFinite(vertAngle))
+                            {
+                                float targetPitch = Mathf.Clamp(-vertAngle, -AimAssistPitchLimit, AimAssistPitchLimit);
+                                float pitchDelta = targetPitch - _camera.rotationX;
+                                if (IsFinite(pitchDelta))
+                                    aimPitch = Mathf.Clamp(pitchDelta * 0.035f, -2f, 2f);
+                            }
+                        }
+                    }
+                }
+
+                // Combine: aim assist + RL adjustment
+                _smoothYaw = Mathf.Lerp(IsFinite(_smoothYaw) ? _smoothYaw : 0f, IsFinite(rawYaw) ? rawYaw : 0f, 0.5f);
+                _smoothPitch = Mathf.Lerp(IsFinite(_smoothPitch) ? _smoothPitch : 0f, IsFinite(rawPitch) ? rawPitch : 0f, 0.5f);
+                float finalYaw = (IsFinite(aimYaw) ? aimYaw : 0f) + _smoothYaw;
+                float finalPitch = (IsFinite(aimPitch) ? aimPitch : 0f) + _smoothPitch;
+                float minPitch = Mathf.Max(_camera.minimumY, -SafePitchLimit);
+                float maxPitch = Mathf.Min(_camera.maximumY, SafePitchLimit);
+                float nextYaw = IsFinite(finalYaw) ? _camera.rotationY + finalYaw : _camera.rotationY;
+                float nextPitch = IsFinite(finalPitch) ? _camera.rotationX + finalPitch : _camera.rotationX;
+                nextPitch = Mathf.Clamp(nextPitch, minPitch, maxPitch);
+
+                Vector3 proposedLook = Quaternion.Euler(-nextPitch, nextYaw, 0f) * Vector3.forward;
+                if (IsFinite(nextYaw) && IsFinite(nextPitch) && IsValidDirection(proposedLook))
+                {
+                    _camera.rotationY = nextYaw;
+                    _camera.rotationX = nextPitch;
+                }
             }
 
-            // --- Movement via inputDir ---
+            // --- Movement: nav direction + RL correction ---
             if (_player.activated && _inputDirField != null)
             {
                 var forward = _player.transform.forward;
@@ -246,82 +378,101 @@ namespace UltrabotMod
                 forward.y = 0; forward.Normalize();
                 right.y = 0; right.Normalize();
 
-                var moveDir = forward * actions[0] + right * actions[1];
+                // RL movement input (strafe, retreat, etc.)
+                var rlDir = forward * actions[0] + right * actions[1];
+
+                // NavMeshAgent desired direction (pathfinding to target)
+                var navDir = GetNavDesiredDirection();
+
+                Vector3 moveDir;
+                if (navDir.magnitude > 0.01f)
+                {
+                    // Blend: 60% nav direction + 40% RL direction
+                    // Bot follows navmesh path but RL can strafe/dodge
+                    moveDir = navDir * 0.6f + rlDir * 0.4f;
+                }
+                else
+                {
+                    // No nav path — RL has full control (air, no navmesh area)
+                    moveDir = rlDir;
+                }
+
                 if (moveDir.magnitude > 1f)
                     moveDir.Normalize();
+
+                if (IsValidDirection(moveDir))
+                {
+                    Vector3 rayOrigin = _player.transform.position + Vector3.up * WallSlideRayHeight;
+                    if (Physics.Raycast(rayOrigin, moveDir.normalized, out RaycastHit wallHit, WallSlideCheckDistance, ~0, QueryTriggerInteraction.Ignore))
+                    {
+                        Vector3 wallNormal = wallHit.normal;
+                        if (Mathf.Abs(wallNormal.y) < 0.7f && IsValidDirection(wallNormal))
+                        {
+                            Vector3 slideDir = Vector3.ProjectOnPlane(moveDir, wallNormal);
+                            moveDir = IsValidDirection(slideDir) ? slideDir.normalized : Vector3.zero;
+                        }
+                    }
+                }
 
                 _inputDirField.SetValue(_player, moveDir);
             }
 
-            // --- Discrete actions ---
+            // --- All discrete actions via InputActionState ---
             bool jump = actions[4] > 0.5f;
             bool dash = actions[5] > 0.5f;
             bool slide = actions[6] > 0.5f;
             bool firePrimary = actions[7] > 0.5f;
             bool fireSecondary = actions[8] > 0.5f;
             bool punch = actions[9] > 0.5f;
-            bool whiplash = actions[17] > 0.5f;
-            bool slam = actions[18] > 0.5f;
-            bool swapVar = actions[19] > 0.5f;
+            bool whiplash = actions[16] > 0.5f;
+            bool slam = actions[17] > 0.5f;
+            bool swapVar = actions[18] > 0.5f;
+            bool changeFist = actions[19] > 0.5f;
 
-            // JUMP — only if on ground
-            if (jump && !_prevButtons[4] && _jumpCooldown <= 0 && _player.activated)
+            // Check if any enemy is roughly in front (fire gate)
+            bool enemyInFront = false;
+            if (nearestEnemy != null)
             {
-                var gc = _player.gc;
-                if (gc != null && gc.onGround)
+                Vector3 toE = nearestEnemy.transform.position - _player.transform.position;
+                float eDist = toE.magnitude;
+                if (eDist > 0.1f)
                 {
-                    _player.Jump();
-                    _jumpCooldown = JumpCD;
+                    float dot = Vector3.Dot(_player.transform.forward, toE / eDist);
+                    // Allow fire if enemy within ~70° cone AND within 50m
+                    // OR within melee range (5m, any angle — for punch)
+                    enemyInFront = (dot > 0.3f && eDist < 50f) || eDist < 5f;
                 }
             }
 
-            // DASH — only if stamina available
-            if (dash && !_prevButtons[5] && _dashCooldown <= 0 && _player.activated
-                && _player.boostCharge >= 100f)
+            // Store pending InputActionState — will be applied in ApplyPendingInputStates()
+            // which runs from MonoBehaviour.Update() (same phase as game scripts).
+            // Coroutines run AFTER Update, so setting PerformedFrame here would be 1 frame late.
+            if (_inputSystemReady)
             {
-                _dodgeMethod?.Invoke(_player, null);
-                _dashCooldown = DashCD;
+                // No enemy gate — RL learns when to fire (needed for railcannon charge,
+                // coin tosses, rocket riding, breakables). Wasted-shot penalty lives in reward.
+                bool f1Allowed = firePrimary;
+                bool f2Allowed = fireSecondary;
+
+                _pJump = jump && !_prevButtons[4];
+                _pDash = dash && !_prevButtons[5];
+                _pSlide = slide;
+                _pPunch = punch && !_prevButtons[9];
+                _pFire1 = f1Allowed;
+                _pFire2 = f2Allowed;
+                // Whiplash via Hook InputActionState (HookArm has no ThrowHook method!)
+                _pHook = whiplash && !_prevButtons[16];
+                _pChangeFist = changeFist && !_prevButtons[19] && _changeFistCooldown <= 0;
+                _pChangeFistReleased = !changeFist && _prevButtons[19];
+                _hasPendingInputs = true;
             }
 
-            // SLIDE — only if on ground
-            if (slide && !_player.sliding && _slideCooldown <= 0 && _player.activated)
+            // SLAM — trigger via Slide InputActionState while falling
+            // The game handles slam internally when it sees Slide + player.falling
+            // Slamdown(1f) is wrong — it just stops movement in air
+            if (slam && !_prevButtons[17] && _player.falling)
             {
-                var gc = _player.gc;
-                if (gc != null && gc.onGround)
-                {
-                    _startSlideMethod?.Invoke(_player, null);
-                    _slideCooldown = SlideCD;
-                }
-            }
-            else if (!slide && _player.sliding)
-            {
-                _player.StopSlide();
-            }
-
-            // SLAM — only if in the air
-            if (slam && !_prevButtons[18] && _slamCooldown <= 0 && _player.falling)
-            {
-                _player.Slamdown(1f);
-                _slamCooldown = SlamCD;
-            }
-
-            // WHIPLASH — only if equipped
-            if (whiplash && !_prevButtons[17] && _whiplashCooldown <= 0 && _hookArm != null
-                && _hookArm.equipped)
-            {
-                _hookArm.SendMessage("ThrowHook", SendMessageOptions.DontRequireReceiver);
-                _whiplashCooldown = WhiplashCD;
-            }
-
-            // PUNCH — only if ready
-            if (punch && !_prevButtons[9] && _punchCooldown <= 0)
-            {
-                if (_fistControl != null && _fistControl.currentPunch != null
-                    && _fistControl.currentPunch.ready && _fistControl.fistCooldown <= 0f)
-                {
-                    _fistControl.currentPunch.PunchStart();
-                    _punchCooldown = PunchCD;
-                }
+                _pSlide = true; // will be applied via Harmony prefix
             }
 
             // WEAPON SLOTS
@@ -337,7 +488,7 @@ namespace UltrabotMod
                     }
                 }
 
-                if (swapVar && !_prevButtons[19] && _weaponSwitchCooldown <= 0)
+                if (swapVar && !_prevButtons[18] && _weaponSwitchCooldown <= 0)
                 {
                     int nextVar = (_gunControl.currentVariationIndex + 1);
                     _gunControl.SwitchWeapon(
@@ -347,27 +498,56 @@ namespace UltrabotMod
                 }
             }
 
-            // FIRE — via PlayerInput's InputActionState (weapons read these in Update())
-            if (_fireSystemReady)
-            {
-                SetFireInput(_fire1State, firePrimary);
-                SetFireInput(_fire2State, fireSecondary);
-            }
-
             // Save button states for edge detection
             for (int i = 0; i < ActionSize; i++)
                 _prevButtons[i] = actions[i] > 0.5f;
         }
 
+        /// <summary>
+        /// Apply pending InputActionState changes. Must be called from MonoBehaviour.Update()
+        /// so PerformedFrame is set in the same phase where game scripts check WasPerformedThisFrame.
+        /// </summary>
+        public void ApplyPendingInputStates()
+        {
+            if (!_hasPendingInputs || !_inputSystemReady) return;
+            _hasPendingInputs = false;
+
+            // Get FRESH InputActionState each frame from InputManager.InputSource
+            SetActionInput("Jump", _pJump);
+            SetActionInput("Dodge", _pDash);
+            SetActionInput("Slide", _pSlide);
+            SetActionInput("Punch", _pPunch);
+            SetActionInput("Fire1", _pFire1);
+            SetActionInput("Fire2", _pFire2);
+            SetActionInput("Hook", _pHook);
+
+            if (_pChangeFist && _fistControl != null)
+            {
+                _fistControl.ForceArm(1, true);
+                _changeFistCooldown = ChangeFistCD;
+            }
+            else if (_pChangeFistReleased && _fistControl != null)
+            {
+                _fistControl.ForceArm(0, true);
+            }
+        }
+
         public void ReleaseAll()
         {
-            if (_fireSystemReady)
+            if (_inputSystemReady)
             {
-                SetFireInput(_fire1State, false);
-                SetFireInput(_fire2State, false);
+                SetActionInput("Fire1", false);
+                SetActionInput("Fire2", false);
+                SetActionInput("Jump", false);
+                SetActionInput("Dodge", false);
+                SetActionInput("Slide", false);
+                SetActionInput("Punch", false);
+                SetActionInput("Hook", false);
+                SetActionInput("ChangeFist", false);
             }
 
             _prevButtons = new bool[ActionSize];
+            _prevActionStatesByName.Clear();
             _smoothYaw = 0f;
             _smoothPitch = 0f;
 

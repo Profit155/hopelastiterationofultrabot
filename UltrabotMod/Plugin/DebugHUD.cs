@@ -38,7 +38,13 @@ namespace UltrabotMod
         public float RewDamage;
         public float RewDeath;
         public float RewExplore;
-        public float RewSurvival;
+        public float RewHeight;
+        public float RewFacing;
+        public float RewStepCost;
+
+        // NavMesh status
+        public bool NavAgentActive;
+        public float NavAgentDist;
 
         private static readonly string[] RankNames = {
             "D", "C", "B", "A", "S", "SS", "SSS", "ULTRAKILL"
@@ -68,8 +74,8 @@ namespace UltrabotMod
                 _bgStyle.normal.background = bgTex;
             }
 
-            float w = 280;
-            float h = 380;
+            float w = 300;
+            float h = 480;
             float x = Screen.width - w - 10;
             float y = 10;
 
@@ -82,31 +88,38 @@ namespace UltrabotMod
             string rankName = (RankIndex >= 0 && RankIndex < RankNames.Length)
                 ? RankNames[RankIndex] : "?";
 
-            DrawLine(ref ly, lx, lh, $"=== ULTRABOT DEBUG ===");
-            DrawLine(ref ly, lx, lh, $"Connected: {(Connected ? "YES" : "NO")}");
+            DrawLine(ref ly, lx, lh, "=== ULTRABOT DEBUG ===");
+            DrawLine(ref ly, lx, lh, $"Connected: {(Connected ? "YES" : "NO")}  NavMesh: {(NavAgentActive ? "ON" : "OFF")}");
             DrawLine(ref ly, lx, lh, $"Steps: {EpisodeSteps} (total: {TotalSteps})");
             DrawLine(ref ly, lx, lh, $"HP: {Hp:F0}  Rank: {rankName}");
-            DrawLine(ref ly, lx, lh, $"");
-            DrawLine(ref ly, lx, lh, $"--- Stats ---");
+            DrawLine(ref ly, lx, lh, "");
+            DrawLine(ref ly, lx, lh, "--- Episode Stats ---");
             DrawLine(ref ly, lx, lh, $"Kills: {Kills}  Style: {StyleScore}");
             DrawLine(ref ly, lx, lh, $"Parries: {Parries}  Headshots: {Headshots}");
-            DrawLine(ref ly, lx, lh, $"Damage taken: {DamageTaken}  Deaths: {Deaths}");
-            DrawLine(ref ly, lx, lh, $"Explore dist: {ExplorationDist:F1} (max: {MaxExplorationDist:F1})");
-            DrawLine(ref ly, lx, lh, $"");
-            DrawLine(ref ly, lx, lh, $"--- Reward (this step) ---");
-            DrawLine(ref ly, lx, lh, $"Style:    {RewStyle:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Kills:    {RewKills:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Parry:    {RewParry:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Headshot: {RewHeadshot:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Rank:     {RewRank:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Explore:  {RewExplore:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Damage:   {RewDamage:+0.000;-0.000}");
-            DrawLine(ref ly, lx, lh, $"Total:    {LastReward:+0.000;-0.000}  (cum: {CumulativeReward:+0.0;-0.0})");
+            DrawLine(ref ly, lx, lh, $"Dmg taken: {DamageTaken}  Deaths: {Deaths}");
+            DrawLine(ref ly, lx, lh, $"Explore: {ExplorationDist:F1}m (max: {MaxExplorationDist:F1}m)");
+            DrawLine(ref ly, lx, lh, $"Nav target dist: {NavAgentDist:F1}m");
+            DrawLine(ref ly, lx, lh, "");
+            DrawLine(ref ly, lx, lh, "--- Reward (last step) ---");
+            DrawLine(ref ly, lx, lh, $"Style:     {RewStyle:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Kills:     {RewKills:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Parry:     {RewParry:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Headshot:  {RewHeadshot:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Rank:      {RewRank:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Explore:   {RewExplore:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Height:    {RewHeight:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Facing:    {RewFacing:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Damage:    {RewDamage:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Death:     {RewDeath:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Step cost: {RewStepCost:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, "");
+            DrawLine(ref ly, lx, lh, $"Step total:  {LastReward:+0.000;-0.000}");
+            DrawLine(ref ly, lx, lh, $"Episode sum: {CumulativeReward:+0.0;-0.0}");
         }
 
         private void DrawLine(ref float y, float x, float h, string text)
         {
-            GUI.Label(new Rect(x, y, 260, h), text, _style);
+            GUI.Label(new Rect(x, y, 280, h), text, _style);
             y += h;
         }
     }

@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import signal
 from pathlib import Path
 
 import torch
@@ -39,7 +40,7 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=1.0, help="Game time scale (1.0 = normal)")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=256, help="Mini-batch size")
-    parser.add_argument("--n-steps", type=int, default=2048, help="Steps per PPO rollout")
+    parser.add_argument("--n-steps", type=int, default=4096, help="Steps per PPO rollout")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"), help="Checkpoint directory")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="TensorBoard log directory")
@@ -77,7 +78,7 @@ def main() -> None:
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,          # encourage exploration
+            ent_coef=0.05,          # encourage action exploration
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=1,
@@ -106,11 +107,18 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         print("\n[Train] Interrupted by user.")
-
-    # Save final model
-    model.save(args.checkpoint_dir / "latest")
-    print(f"[Train] Model saved to {args.checkpoint_dir / 'latest.zip'}")
-    env.close()
+    finally:
+        # Always save and clean up properly
+        try:
+            model.save(args.checkpoint_dir / "latest")
+            print(f"[Train] Model saved to {args.checkpoint_dir / 'latest.zip'}")
+        except Exception as e:
+            print(f"[Train] WARNING: Could not save model: {e}")
+        try:
+            env.close()
+            print("[Train] Environment closed cleanly.")
+        except Exception as e:
+            print(f"[Train] WARNING: Error closing environment: {e}")
 
 
 if __name__ == "__main__":
